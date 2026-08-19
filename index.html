@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v3 自动识别修正版 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v4 快速求解修正版 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -303,8 +303,8 @@ async function solveBoard(start){
   let seq=0,expanded=0;
   const rootKey=stateKey(start);
   parents.set(rootKey,{parent:null,move:null,board:start});
-  const heap=new MinHeap((a,b)=>a.depth-b.depth||a.avail-b.avail||a.seq-b.seq);
-  heap.push({board:start,key:rootKey,depth:-countTiles(start),avail:-availableMoves(start).length,seq:seq++});
+  const heap=new MinHeap((a,b)=>a.remain-b.remain||a.avail-b.avail||a.seq-b.seq);
+  heap.push({board:start,key:rootKey,remain:countTiles(start),avail:-availableMoves(start).length,seq:seq++});
   while(heap.length){
     const cur=heap.pop(),b=cur.board,k=cur.key;
     if(visited.has(k))continue;
@@ -327,13 +327,13 @@ async function solveBoard(start){
       localSeen.add(nk);
       const av=availableMoves(nb).length;
       parents.set(nk,{parent:k,move:m,board:nb});
-      heap.push({board:nb,key:nk,depth:-countTiles(nb),avail:-av,seq:seq++});
+      heap.push({board:nb,key:nk,remain:countTiles(nb),avail:-av,seq:seq++});
     }
     if(expanded%20===0){
       recognitionStatus.innerHTML=`正在计算路线……已检查 ${expanded.toLocaleString()} 个局面`;
       await sleep(0);
     }
-    if(expanded>250000||performance.now()-t0>45000)throw new Error('搜索时间过长，请重新截图或调整识别框后再试。');
+    if(expanded>250000||performance.now()-t0>60000)throw new Error('搜索时间过长。请重新上传刚进入关卡时的完整截图后再试。');
   }
   throw new Error('当前识别结果没有找到通关路线。可能是网格没对齐或有图案识别错误。');
 }
