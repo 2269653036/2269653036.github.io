@@ -27,7 +27,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
 <div class="wrap">
   <div class="hero">
     <h1>🧩 砖了个砖助手</h1>
-    <p>手机上传一张游戏截图 → 自动识别棋盘 → 本地搜索完整通关路线 → 一步一步照着操作。截图不会上传到服务器。</p>
+    <p>手机上传一张游戏截图 → 自动定位 14×10 棋盘 → 自动识别相同图案 → 本地计算完整通关路线。无需手动调网格。</p>
   </div>
 
   <div class="card" id="uploadCard">
@@ -37,16 +37,16 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
   </div>
 
   <div class="card hide" id="previewCard">
-    <div class="title">2. 检查棋盘框</div>
-    <div class="small">绿色网格应该正好套住 10 列 × 14 行的砖块。一般不用调整。</div>
+    <div class="title">2. 自动识别棋盘</div>
+    <div class="small">绿色网格会自动套住 10 列 × 14 行棋盘；正常情况下不需要手动调整。</div>
     <div class="preview"><canvas id="previewCanvas"></canvas></div>
-    <details>
+    <details class="hide">
       <summary>网格没对齐？手动微调</summary>
       <div class="ctrl"><label><span>左右</span><span id="xVal">0.00 格</span></label><input id="xAdj" type="range" min="-0.6" max="0.6" step="0.01" value="0"></div>
       <div class="ctrl"><label><span>上下</span><span id="yVal">0.00 格</span></label><input id="yAdj" type="range" min="-2" max="2" step="0.01" value="0"></div>
       <div class="ctrl"><label><span>格子大小</span><span id="sVal">100.0%</span></label><input id="sAdj" type="range" min="0.96" max="1.04" step="0.001" value="1"></div>
     </details>
-    <button id="solveBtn">识别并计算完整路线</button>
+    <button id="solveBtn">自动识别并计算完整路线</button>
     <div id="recognitionStatus" class="status hide"></div>
   </div>
 
@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">非官方个人辅助工具 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v2 自动识别版 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -118,50 +118,78 @@ fileInput.addEventListener('change',()=>{
 });
 
 function mse(a,b){let s=0;for(let i=0;i<a.length;i++){const d=(a[i]-b[i])/255;s+=d*d}return s/a.length}
-function findClusters(features,filled){
-  const parent=Array(N).fill(-1),sz=Array(N).fill(0);
-  for(const i of filled){parent[i]=i;sz[i]=1}
-  const root=x=>{while(parent[x]!==x){parent[x]=parent[parent[x]];x=parent[x]}return x};
-  const pairs=[];
-  for(let a=0;a<filled.length;a++)for(let b=a+1;b<filled.length;b++){
-    const i=filled[a],j=filled[b],d=mse(features[i],features[j]);
-    if(d<0.012)pairs.push([d,i,j]);
-  }
-  pairs.sort((a,b)=>a[0]-b[0]);
-  for(const [d,i,j] of pairs){
-    if(d>0.009)break;
-    let ri=root(i),rj=root(j);if(ri===rj)continue;
-    if(sz[ri]+sz[rj]<=4){
-      if(sz[ri]<sz[rj]){const t=ri;ri=rj;rj=t}
-      parent[rj]=ri;sz[ri]+=sz[rj];
-    }
-  }
-  const comps=new Map();
-  for(const i of filled){const r=root(i);if(!comps.has(r))comps.set(r,[]);comps.get(r).push(i)}
-  return [...comps.values()];
+
+// v2 recognition: use a very small perceptual fingerprint from the center of each tile.
+// This is much more tolerant of anti-aliasing/compression than the old 16x16 pixel-exact matcher.
+function featureDistance(a,b){let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d}return s/a.length}
+function nearestOf(i,pool,D,k){
+  const a=[];for(const j of pool)if(j!==i)a.push([D[i][j],j]);a.sort((x,y)=>x[0]-y[0]);return a.slice(0,k).map(x=>x[1]);
 }
-async function recognize(){
-  const g=geometry(),tiny=document.createElement('canvas');
-  tiny.width=18;tiny.height=18;
-  const tc=tiny.getContext('2d',{willReadFrequently:true});
-  const features=Array(N),filled=[];reps={};
-  const mx=g.cw*0.05,my=g.ch*0.05;
-  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
-    const i=idx(r,c),sx=g.x+c*g.cw+mx,sy=g.y+r*g.ch+my,sw=g.cw-2*mx,sh=g.ch-2*my;
-    tc.clearRect(0,0,18,18);tc.drawImage(img,sx,sy,sw,sh,0,0,18,18);
-    const data=tc.getImageData(0,0,18,18).data,f=new Uint8Array(18*18*3);
-    let k=0,sum=0;
-    for(let p=0;p<data.length;p+=4){f[k++]=data[p];f[k++]=data[p+1];f[k++]=data[p+2];sum+=data[p]+data[p+1]+data[p+2]}
-    features[i]=f;
-    const bright=sum/(18*18*3*255);
-    if(bright>0.47)filled.push(i);
+function groupByPerceptualSimilarity(features,filled){
+  const D=Array.from({length:N},()=>new Float32Array(N));
+  for(let a=0;a<filled.length;a++)for(let b=a+1;b<filled.length;b++){
+    const i=filled[a],j=filled[b],d=featureDistance(features[i],features[j]);D[i][j]=D[j][i]=d;
   }
-  const comps=findClusters(features,filled),bad=comps.filter(x=>x.length!==2&&x.length!==4);
-  const board=Array(N).fill(0);let gid=1;
-  for(const comp of comps){for(const i of comp)board[i]=gid;reps[gid]=comp[0];gid++}
-  return {board,filled:filled.length,groups:comps.length,bad,even:bad.length===0,g};
+  const unused=new Set(filled),groups=[];
+  // Prefer 4-tile mutual-nearest cliques. If a pair has already been removed in-game,
+  // the two remaining identical tiles normally form a mutual-nearest pair.
+  while(unused.size){
+    let chosen=null;
+    if(unused.size>=4){
+      const list=[...unused];
+      // pick the cleanest 4-clique first (largest separation from outsiders)
+      let bestScore=-1;
+      for(const i of list){
+        const ns=nearestOf(i,unused,D,3);if(ns.length<3)continue;
+        const cand=new Set([i,...ns]);if(cand.size!==4)continue;
+        let clique=true;
+        for(const m of cand){const s2=new Set([m,...nearestOf(m,unused,D,3)]);if(s2.size!==4||[...s2].some(x=>!cand.has(x))){clique=false;break}}
+        if(!clique)continue;
+        // separation score: outside nearest / inside farthest. Larger is safer.
+        let inside=0,outside=Infinity;
+        for(const m of cand){for(const n of cand)if(m!==n)inside=Math.max(inside,D[m][n]);for(const n of unused)if(!cand.has(n))outside=Math.min(outside,D[m][n]);}
+        const score=(outside===Infinity?999:outside)/(inside+1e-8);
+        if(score>bestScore){bestScore=score;chosen=[...cand]}
+      }
+    }
+    if(!chosen){
+      // partial board fallback: mutual nearest pair
+      let best=null,bestD=Infinity;
+      for(const i of unused){const ni=nearestOf(i,unused,D,1);if(!ni.length)continue;const j=ni[0];const nj=nearestOf(j,unused,D,1);if(nj.length&&nj[0]===i&&D[i][j]<bestD){bestD=D[i][j];best=[i,j]}}
+      chosen=best;
+    }
+    if(!chosen)throw new Error('自动图案分组失败，请使用刚进入关卡时的完整截图重试。');
+    groups.push(chosen);for(const i of chosen)unused.delete(i);
+  }
+  return {groups,D};
 }
 
+async function recognize(){
+  // Screenshot layout for this game is proportional across current iPhone screenshots.
+  // Use the normalized board rectangle, then identify empty cells and cluster repeated icons.
+  const g=geometry(),tiny=document.createElement('canvas');tiny.width=4;tiny.height=4;const tc=tiny.getContext('2d',{willReadFrequently:true});
+  const features=Array(N),filled=[];reps={};
+  const margin=g.s*0.18;
+  // full-resolution canvas is used only to distinguish solid brown empty cells from cream tiles
+  const full=document.createElement('canvas');full.width=img.naturalWidth;full.height=img.naturalHeight;const fc=full.getContext('2d',{willReadFrequently:true});fc.drawImage(img,0,0);
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const i=idx(r,c),sx=g.x+c*g.s+margin,sy=g.y+r*g.s+margin,sw=g.s-2*margin,sh=sw;
+    // perceptual feature: heavy downsample (4x4 RGB) makes same icons stable even with compression/subpixel shifts
+    tc.clearRect(0,0,4,4);tc.drawImage(img,sx,sy,sw,sh,0,0,4,4);const data=tc.getImageData(0,0,4,4).data;const f=new Float32Array(4*4*3);let q=0;for(let p=0;p<data.length;p+=4){f[q++]=data[p]/255;f[q++]=data[p+1]/255;f[q++]=data[p+2]/255}features[i]=f;
+    // empty cells are nearly a spatially uniform brown. Measure within-channel spatial variation.
+    const box=Math.max(8,Math.floor(sw));const ix=Math.max(0,Math.floor(sx)),iy=Math.max(0,Math.floor(sy));const iw=Math.min(box,full.width-ix),ih=Math.min(box,full.height-iy);const d=fc.getImageData(ix,iy,iw,ih).data;
+    let sr=0,sg=0,sb=0,sr2=0,sg2=0,sb2=0,n=0;for(let p=0;p<d.length;p+=4){const R=d[p]/255,G=d[p+1]/255,B=d[p+2]/255;sr+=R;sg+=G;sb+=B;sr2+=R*R;sg2+=G*G;sb2+=B*B;n++}
+    const vr=Math.max(0,sr2/n-(sr/n)**2),vg=Math.max(0,sg2/n-(sg/n)**2),vb=Math.max(0,sb2/n-(sb/n)**2);const spatialStd=(Math.sqrt(vr)+Math.sqrt(vg)+Math.sqrt(vb))/3;
+    if(spatialStd>0.02)filled.push(i);
+  }
+  if(!filled.length)throw new Error('没有识别到砖块，请确认上传的是完整游戏截图。');
+  if(filled.length%2!==0)throw new Error(`识别到 ${filled.length} 块砖（奇数），说明棋盘定位异常。请重新截一张完整游戏图。`);
+  const {groups}=groupByPerceptualSimilarity(features,filled);
+  const bad=groups.filter(x=>x.length!==2&&x.length!==4);
+  if(bad.length)throw new Error('图案自动分组未通过校验，请重新截一张完整游戏图。');
+  const board=Array(N).fill(0);let gid=1;for(const group of groups){for(const i of group)board[i]=gid;reps[gid]=group[0];gid++}
+  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g};
+}
 function allowedOnLine(line){
   const n=line.length,left=Array(n).fill(0),right=Array(n).fill(0);
   let last=-1,shift=0;
@@ -368,13 +396,13 @@ $('restartBtn').addEventListener('click',()=>{
 
 solveBtn.addEventListener('click',async()=>{
   if(!img)return;
-  solveBtn.disabled=true;recognitionStatus.classList.remove('hide');recognitionStatus.textContent='正在识别 14×10 棋盘……';
+  solveBtn.disabled=true;recognitionStatus.classList.remove('hide');recognitionStatus.textContent='正在自动识别棋盘和相同图案……';
   try{
     const rec=await recognize();lastGeom=rec.g;initialBoard=rec.board;
     if(rec.filled===0)throw new Error('没有识别到砖块，请检查绿色网格是否套住棋盘。');
     if(!rec.even){
       const sizes=rec.bad.map(x=>x.length).join('、');
-      throw new Error(`图案分组不完整（异常组大小：${sizes}）。请展开“手动微调”，让绿色网格更准确地套住每个格子后重试。`);
+      throw new Error(`图案分组不完整（异常组大小：${sizes}）。请重新截一张完整游戏图后重试。`);
     }
     recognitionStatus.innerHTML=`<span class="ok">✓ 识别成功：</span>${rec.filled} 块砖，${rec.groups} 组图案。正在搜索完整路线……`;
     await sleep(20);
