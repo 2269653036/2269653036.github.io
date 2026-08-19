@@ -41,7 +41,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <div class="small">绿色网格会自动套住 10 列 × 14 行棋盘；正常情况下不需要手动调整。</div>
     <div class="preview"><canvas id="previewCanvas"></canvas></div>
     <details class="hide">
-      <summary>网格没对齐？手动微调</summary>
+      <summary>高级：只有网格明显错位时才手动微调</summary>
       <div class="ctrl"><label><span>左右</span><span id="xVal">0.00 格</span></label><input id="xAdj" type="range" min="-0.6" max="0.6" step="0.01" value="0"></div>
       <div class="ctrl"><label><span>上下</span><span id="yVal">0.00 格</span></label><input id="yAdj" type="range" min="-2" max="2" step="0.01" value="0"></div>
       <div class="ctrl"><label><span>格子大小</span><span id="sVal">100.0%</span></label><input id="sAdj" type="range" min="0.96" max="1.04" step="0.001" value="1"></div>
@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v2 自动识别版 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v3 自动识别修正版 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -119,7 +119,7 @@ fileInput.addEventListener('change',()=>{
 
 function mse(a,b){let s=0;for(let i=0;i<a.length;i++){const d=(a[i]-b[i])/255;s+=d*d}return s/a.length}
 
-// v2 recognition: use a very small perceptual fingerprint from the center of each tile.
+// v3 recognition: use a very small perceptual fingerprint from the center of each tile.
 // This is much more tolerant of anti-aliasing/compression than the old 16x16 pixel-exact matcher.
 function featureDistance(a,b){let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d}return s/a.length}
 function nearestOf(i,pool,D,k){
@@ -152,6 +152,18 @@ function groupByPerceptualSimilarity(features,filled){
         if(score>bestScore){bestScore=score;chosen=[...cand]}
       }
     }
+    if(!chosen && unused.size>=4){
+      // Robust fallback for a fresh full board: take the tightest seed + its three nearest tiles.
+      // Same icons are rendered from the same sprite, so their 8x8 perceptual fingerprints are much closer
+      // to each other than to a different icon even when the icons have similar colors.
+      let best=null,bestCost=Infinity;
+      for(const i of unused){
+        const ns=nearestOf(i,unused,D,3);if(ns.length<3)continue;
+        const cand=[i,...ns];let cost=0;for(let a=0;a<4;a++)for(let b=a+1;b<4;b++)cost+=D[cand[a]][cand[b]];
+        if(cost<bestCost){bestCost=cost;best=cand}
+      }
+      chosen=best;
+    }
     if(!chosen){
       // partial board fallback: mutual nearest pair
       let best=null,bestD=Infinity;
@@ -167,15 +179,20 @@ function groupByPerceptualSimilarity(features,filled){
 async function recognize(){
   // Screenshot layout for this game is proportional across current iPhone screenshots.
   // Use the normalized board rectangle, then identify empty cells and cluster repeated icons.
-  const g=geometry(),tiny=document.createElement('canvas');tiny.width=4;tiny.height=4;const tc=tiny.getContext('2d',{willReadFrequently:true});
+  const g=geometry(),tiny=document.createElement('canvas');tiny.width=8;tiny.height=8;const tc=tiny.getContext('2d',{willReadFrequently:true});
   const features=Array(N),filled=[];reps={};
-  const margin=g.s*0.18;
+  // IMPORTANT: the board uses separate cell width/height (cw/ch). v2 accidentally used g.s,
+  // which does not exist and produced NaN coordinates on iPhone Safari.
+  const mx=g.cw*0.16,my=g.ch*0.16,sw=g.cw-2*mx,sh=g.ch-2*my;
+  if(![g.x,g.y,g.cw,g.ch,mx,my,sw,sh].every(Number.isFinite) || sw<=2 || sh<=2){
+    throw new Error('棋盘坐标计算异常，请重新选择截图。');
+  }
   // full-resolution canvas is used only to distinguish solid brown empty cells from cream tiles
   const full=document.createElement('canvas');full.width=img.naturalWidth;full.height=img.naturalHeight;const fc=full.getContext('2d',{willReadFrequently:true});fc.drawImage(img,0,0);
   for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
-    const i=idx(r,c),sx=g.x+c*g.s+margin,sy=g.y+r*g.s+margin,sw=g.s-2*margin,sh=sw;
+    const i=idx(r,c),sx=g.x+c*g.cw+mx,sy=g.y+r*g.ch+my;
     // perceptual feature: heavy downsample (4x4 RGB) makes same icons stable even with compression/subpixel shifts
-    tc.clearRect(0,0,4,4);tc.drawImage(img,sx,sy,sw,sh,0,0,4,4);const data=tc.getImageData(0,0,4,4).data;const f=new Float32Array(4*4*3);let q=0;for(let p=0;p<data.length;p+=4){f[q++]=data[p]/255;f[q++]=data[p+1]/255;f[q++]=data[p+2]/255}features[i]=f;
+    tc.clearRect(0,0,8,8);tc.drawImage(img,sx,sy,sw,sh,0,0,8,8);const data=tc.getImageData(0,0,8,8).data;const f=new Float32Array(8*8*3);let q=0;for(let p=0;p<data.length;p+=4){f[q++]=data[p]/255;f[q++]=data[p+1]/255;f[q++]=data[p+2]/255}features[i]=f;
     // empty cells are nearly a spatially uniform brown. Measure within-channel spatial variation.
     const box=Math.max(8,Math.floor(sw));const ix=Math.max(0,Math.floor(sx)),iy=Math.max(0,Math.floor(sy));const iw=Math.min(box,full.width-ix),ih=Math.min(box,full.height-iy);const d=fc.getImageData(ix,iy,iw,ih).data;
     let sr=0,sg=0,sb=0,sr2=0,sg2=0,sb2=0,n=0;for(let p=0;p<d.length;p+=4){const R=d[p]/255,G=d[p+1]/255,B=d[p+2]/255;sr+=R;sg+=G;sb+=B;sr2+=R*R;sg2+=G*G;sb2+=B*B;n++}
@@ -396,9 +413,10 @@ $('restartBtn').addEventListener('click',()=>{
 
 solveBtn.addEventListener('click',async()=>{
   if(!img)return;
-  solveBtn.disabled=true;recognitionStatus.classList.remove('hide');recognitionStatus.textContent='正在自动识别棋盘和相同图案……';
+  solveBtn.disabled=true;recognitionStatus.classList.remove('hide');recognitionStatus.textContent='正在自动识别 14×10 棋盘和相同图案……';
   try{
     const rec=await recognize();lastGeom=rec.g;initialBoard=rec.board;
+    console.log('recognition', {filled:rec.filled,groups:rec.groups,geometry:rec.g});
     if(rec.filled===0)throw new Error('没有识别到砖块，请检查绿色网格是否套住棋盘。');
     if(!rec.even){
       const sizes=rec.bad.map(x=>x.length).join('、');
