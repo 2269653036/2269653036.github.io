@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#19a66a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>砖了个砖助手</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;color:#15231d;background:#eef7f2}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(#eaf8f1,#f7faf8);min-height:100vh}
+.wrap{max-width:760px;margin:0 auto;padding:16px 14px 46px}.hero{padding:8px 4px 4px}.hero h1{font-size:28px;margin:4px 0}.hero p{margin:6px 0;color:#52635b;line-height:1.55}
+.card{background:#fff;border:1px solid #dce9e2;border-radius:18px;padding:15px;margin:13px 0;box-shadow:0 5px 18px rgba(18,70,46,.07)}
+.title{font-size:18px;font-weight:800;margin-bottom:10px}.small{font-size:13px;color:#66766e;line-height:1.5}.ok{color:#087a48}.bad{color:#b42318}.hide{display:none!important}
+.file{display:block;border:2px dashed #9bcdb3;border-radius:15px;padding:20px 12px;text-align:center;background:#f5fcf8;font-weight:750;cursor:pointer}.file input{display:none}
+button{appearance:none;border:0;border-radius:14px;padding:14px 15px;font-size:17px;font-weight:800;background:#148f5a;color:white;width:100%;margin-top:10px;box-shadow:0 4px 10px rgba(20,143,90,.16)}
+button:disabled{opacity:.42;box-shadow:none}button.secondary{background:#edf4f0;color:#1b3328;box-shadow:none}.row{display:flex;gap:9px}.row button{flex:1}
+canvas{display:block;width:100%;height:auto;border-radius:12px;background:#8e541f}.preview{background:#111;border-radius:14px;overflow:hidden}.status{margin-top:10px;padding:10px 12px;border-radius:12px;background:#f2f6f4;font-size:14px;line-height:1.5}
+details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{font-weight:700;cursor:pointer}.ctrl{margin:10px 0}.ctrl label{font-size:13px;color:#596a62;display:flex;justify-content:space-between}.ctrl input{width:100%}
+.stepHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}.badge{background:#e7f7ef;color:#087a48;font-weight:800;border-radius:999px;padding:6px 10px;white-space:nowrap}.instruction{font-size:18px;font-weight:800;line-height:1.55;margin:10px 0}.legend{font-size:13px;color:#596a62;line-height:1.6}.dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin:0 4px 0 8px}.red{background:#ff3131}.green{background:#21a366}.orange{background:#ff9f1c}
+.progress{height:8px;border-radius:99px;background:#e6eee9;overflow:hidden;margin:8px 0}.bar{height:100%;background:#16a365;width:0}.foot{text-align:center;color:#718078;font-size:12px;margin-top:18px}
+@media(max-width:420px){.wrap{padding-left:10px;padding-right:10px}.hero h1{font-size:25px}.instruction{font-size:17px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>🧩 砖了个砖助手</h1>
+    <p>手机上传一张游戏截图 → 自动识别棋盘 → 本地搜索完整通关路线 → 一步一步照着操作。截图不会上传到服务器。</p>
+  </div>
+
+  <div class="card" id="uploadCard">
+    <div class="title">1. 上传当前游戏截图</div>
+    <label class="file">📷 选择截图<input id="fileInput" type="file" accept="image/*"></label>
+    <div id="fileStatus" class="status">请使用完整截图，棋盘要完整显示。</div>
+  </div>
+
+  <div class="card hide" id="previewCard">
+    <div class="title">2. 检查棋盘框</div>
+    <div class="small">绿色网格应该正好套住 10 列 × 14 行的砖块。一般不用调整。</div>
+    <div class="preview"><canvas id="previewCanvas"></canvas></div>
+    <details>
+      <summary>网格没对齐？手动微调</summary>
+      <div class="ctrl"><label><span>左右</span><span id="xVal">0.00 格</span></label><input id="xAdj" type="range" min="-0.6" max="0.6" step="0.01" value="0"></div>
+      <div class="ctrl"><label><span>上下</span><span id="yVal">0.00 格</span></label><input id="yAdj" type="range" min="-2" max="2" step="0.01" value="0"></div>
+      <div class="ctrl"><label><span>格子大小</span><span id="sVal">100.0%</span></label><input id="sAdj" type="range" min="0.96" max="1.04" step="0.001" value="1"></div>
+    </details>
+    <button id="solveBtn">识别并计算完整路线</button>
+    <div id="recognitionStatus" class="status hide"></div>
+  </div>
+
+  <div class="card hide" id="solveCard">
+    <div class="stepHead"><div class="title" style="margin:0">3. 按步骤操作</div><div class="badge" id="stepBadge">准备中</div></div>
+    <div class="progress"><div class="bar" id="progressBar"></div></div>
+    <div class="instruction" id="instruction">正在计算……</div>
+    <canvas id="boardCanvas"></canvas>
+    <div class="legend"><span class="dot red"></span>红框：你要动的砖 <span class="dot orange"></span>橙框：会被一起推动 <span class="dot green"></span>绿框：配对消除目标</div>
+    <div class="row"><button class="secondary" id="prevBtn">上一步</button><button id="nextBtn">我做完了，下一步</button></div>
+    <button class="secondary" id="restartBtn">换一张截图重新计算</button>
+  </div>
+
+  <div class="foot">非官方个人辅助工具 · 所有识别和求解都在浏览器本地完成</div>
+</div>
+<script>
+'use strict';
+const ROWS=14,COLS=10,N=ROWS*COLS;
+const $=id=>document.getElementById(id);
+const fileInput=$('fileInput'),previewCard=$('previewCard'),previewCanvas=$('previewCanvas'),solveBtn=$('solveBtn');
+const recognitionStatus=$('recognitionStatus'),solveCard=$('solveCard'),boardCanvas=$('boardCanvas');
+const stepBadge=$('stepBadge'),instruction=$('instruction'),progressBar=$('progressBar'),prevBtn=$('prevBtn'),nextBtn=$('nextBtn');
+const xAdj=$('xAdj'),yAdj=$('yAdj'),sAdj=$('sAdj');
+let img=null,initialBoard=null,reps={},solutionMoves=[],solutionStates=[],stepIndex=0,lastGeom=null;
+
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function idx(r,c){return r*COLS+c}
+function rc(i){return [Math.floor(i/COLS),i%COLS]}
+function inb(r,c){return r>=0&&r<ROWS&&c>=0&&c<COLS}
+function countTiles(b){let n=0;for(const x of b)if(x)n++;return n}
+function stateKey(b){let s='';for(let i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return s}
+
+function geometry(){
+  const W=img.naturalWidth,H=img.naturalHeight,scale=parseFloat(sAdj.value);
+  const cw=W*0.0942*scale,ch=H*0.04362*scale;
+  return {W,H,cw,ch,x:W*0.0275+parseFloat(xAdj.value)*cw,y:H*0.2380+parseFloat(yAdj.value)*ch};
+}
+function drawPreview(){
+  if(!img)return;
+  const g=geometry();lastGeom=g;
+  const scale=Math.min(1,760/g.W);
+  previewCanvas.width=Math.round(g.W*scale);previewCanvas.height=Math.round(g.H*scale);
+  const c=previewCanvas.getContext('2d');
+  c.drawImage(img,0,0,previewCanvas.width,previewCanvas.height);
+  c.save();c.scale(scale,scale);c.strokeStyle='#00d77f';c.lineWidth=Math.max(2,3/scale);c.fillStyle='rgba(0,215,127,.07)';
+  c.fillRect(g.x,g.y,g.cw*COLS,g.ch*ROWS);
+  for(let k=0;k<=COLS;k++){c.beginPath();c.moveTo(g.x+k*g.cw,g.y);c.lineTo(g.x+k*g.cw,g.y+ROWS*g.ch);c.stroke()}
+  for(let k=0;k<=ROWS;k++){c.beginPath();c.moveTo(g.x,g.y+k*g.ch);c.lineTo(g.x+COLS*g.cw,g.y+k*g.ch);c.stroke()}
+  c.restore();
+}
+[xAdj,yAdj,sAdj].forEach(el=>el.addEventListener('input',()=>{
+  $('xVal').textContent=(+xAdj.value).toFixed(2)+' 格';
+  $('yVal').textContent=(+yAdj.value).toFixed(2)+' 格';
+  $('sVal').textContent=(+sAdj.value*100).toFixed(1)+'%';
+  drawPreview();
+}));
+
+fileInput.addEventListener('change',()=>{
+  const f=fileInput.files&&fileInput.files[0];if(!f)return;
+  const url=URL.createObjectURL(f),im=new Image();
+  im.onload=()=>{
+    img=im;xAdj.value=0;yAdj.value=0;sAdj.value=1;
+    $('fileStatus').innerHTML='<span class="ok">✓ 截图已载入</span>，请检查下面绿色网格。';
+    previewCard.classList.remove('hide');solveCard.classList.add('hide');recognitionStatus.classList.add('hide');
+    drawPreview();URL.revokeObjectURL(url);
+  };
+  im.onerror=()=>{$('fileStatus').innerHTML='<span class="bad">图片读取失败，请换一张截图。</span>';URL.revokeObjectURL(url)};
+  im.src=url;
+});
+
+function mse(a,b){let s=0;for(let i=0;i<a.length;i++){const d=(a[i]-b[i])/255;s+=d*d}return s/a.length}
+function findClusters(features,filled){
+  const parent=Array(N).fill(-1),sz=Array(N).fill(0);
+  for(const i of filled){parent[i]=i;sz[i]=1}
+  const root=x=>{while(parent[x]!==x){parent[x]=parent[parent[x]];x=parent[x]}return x};
+  const pairs=[];
+  for(let a=0;a<filled.length;a++)for(let b=a+1;b<filled.length;b++){
+    const i=filled[a],j=filled[b],d=mse(features[i],features[j]);
+    if(d<0.012)pairs.push([d,i,j]);
+  }
+  pairs.sort((a,b)=>a[0]-b[0]);
+  for(const [d,i,j] of pairs){
+    if(d>0.009)break;
+    let ri=root(i),rj=root(j);if(ri===rj)continue;
+    if(sz[ri]+sz[rj]<=4){
+      if(sz[ri]<sz[rj]){const t=ri;ri=rj;rj=t}
+      parent[rj]=ri;sz[ri]+=sz[rj];
+    }
+  }
+  const comps=new Map();
+  for(const i of filled){const r=root(i);if(!comps.has(r))comps.set(r,[]);comps.get(r).push(i)}
+  return [...comps.values()];
+}
+async function recognize(){
+  const g=geometry(),tiny=document.createElement('canvas');
+  tiny.width=18;tiny.height=18;
+  const tc=tiny.getContext('2d',{willReadFrequently:true});
+  const features=Array(N),filled=[];reps={};
+  const mx=g.cw*0.05,my=g.ch*0.05;
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const i=idx(r,c),sx=g.x+c*g.cw+mx,sy=g.y+r*g.ch+my,sw=g.cw-2*mx,sh=g.ch-2*my;
+    tc.clearRect(0,0,18,18);tc.drawImage(img,sx,sy,sw,sh,0,0,18,18);
+    const data=tc.getImageData(0,0,18,18).data,f=new Uint8Array(18*18*3);
+    let k=0,sum=0;
+    for(let p=0;p<data.length;p+=4){f[k++]=data[p];f[k++]=data[p+1];f[k++]=data[p+2];sum+=data[p]+data[p+1]+data[p+2]}
+    features[i]=f;
+    const bright=sum/(18*18*3*255);
+    if(bright>0.47)filled.push(i);
+  }
+  const comps=findClusters(features,filled),bad=comps.filter(x=>x.length!==2&&x.length!==4);
+  const board=Array(N).fill(0);let gid=1;
+  for(const comp of comps){for(const i of comp)board[i]=gid;reps[gid]=comp[0];gid++}
+  return {board,filled:filled.length,groups:comps.length,bad,even:bad.length===0,g};
+}
+
+function allowedOnLine(line){
+  const n=line.length,left=Array(n).fill(0),right=Array(n).fill(0);
+  let last=-1,shift=0;
+  for(let i=0;i<n;i++){if(line[i]!==0){left[i]=shift;last=i}else shift=last-i}
+  let next=n;shift=0;
+  for(let i=n-1;i>=0;i--){if(line[i]!==0){right[i]=shift;next=i}else shift=next-i}
+  const out=[];
+  for(let i=0;i<n;i++)if(line[i]!==0)for(let s=left[i];s<=right[i];s++)out.push([i,i+s]);
+  return out;
+}
+const DIR={up:[-1,0],down:[1,0],left:[0,-1],right:[0,1]};
+function nearest(b,r,c,dir){
+  const [dr,dc]=DIR[dir];r+=dr;c+=dc;
+  while(inb(r,c)){const v=b[idx(r,c)];if(v)return idx(r,c);r+=dr;c+=dc}
+  return -1;
+}
+function availableMoves(b){
+  const out=[];
+  for(let r=0;r<ROWS;r++){
+    const line=b.slice(r*COLS,r*COLS+COLS);
+    for(const [cs,ce] of allowedOnLine(line)){
+      const t=line[cs];let ep=nearest(b,r,ce,'up');
+      if(ep>=0&&b[ep]===t){out.push({start:idx(r,cs),end:idx(r,ce),search:'up',target:ep});continue}
+      ep=nearest(b,r,ce,'down');
+      if(ep>=0&&b[ep]===t)out.push({start:idx(r,cs),end:idx(r,ce),search:'down',target:ep});
+    }
+  }
+  for(let c=0;c<COLS;c++){
+    const line=[];for(let r=0;r<ROWS;r++)line.push(b[idx(r,c)]);
+    for(const [rs,re] of allowedOnLine(line)){
+      const t=line[rs];let ep=nearest(b,re,c,'left');
+      if(ep>=0&&b[ep]===t){out.push({start:idx(rs,c),end:idx(re,c),search:'left',target:ep});continue}
+      ep=nearest(b,re,c,'right');
+      if(ep>=0&&b[ep]===t)out.push({start:idx(rs,c),end:idx(re,c),search:'right',target:ep});
+    }
+  }
+  return out;
+}
+function applyMove(b,m){
+  const a=b.slice(),[sr,sc]=rc(m.start),[er,ec]=rc(m.end),dr=Math.sign(er-sr),dc=Math.sign(ec-sc),steps=Math.abs(er-sr)+Math.abs(ec-sc);
+  if(steps>0){
+    let q=0,r=sr,c=sc;
+    while(inb(r,c)&&a[idx(r,c)]!==0){q++;r+=dr;c+=dc}
+    for(let i=q-1;i>=0;i--){
+      const si=idx(sr+i*dr,sc+i*dc),di=idx(er+i*dr,ec+i*dc);
+      a[di]=a[si];a[si]=0;
+    }
+  }
+  const tile=a[m.end];if(!tile)return null;
+  a[m.end]=0;
+  const [sdr,sdc]=DIR[m.search];let r=er+sdr,c=ec+sdc;
+  while(inb(r,c)&&a[idx(r,c)]===0){r+=sdr;c+=sdc}
+  if(!inb(r,c)||a[idx(r,c)]!==tile)return null;
+  a[idx(r,c)]=0;
+  return a;
+}
+function moveDistance(m){const [a,b]=rc(m.start),[c,d]=rc(m.end);return Math.abs(a-c)+Math.abs(b-d)}
+function candidates(b){
+  const seen=new Map();
+  for(const m of availableMoves(b)){
+    const nb=applyMove(b,m);if(!nb)continue;
+    const k=stateKey(nb);
+    if(!seen.has(k))seen.set(k,{move:m,board:nb});
+  }
+  const arr=[...seen.values()];
+  for(const x of arr)x.future=availableMoves(x.board).length;
+  arr.sort((a,b)=>b.future-a.future||moveDistance(a.move)-moveDistance(b.move)||a.move.start-b.move.start);
+  return arr;
+}
+class MinHeap{
+  constructor(cmp){this.a=[];this.cmp=cmp}
+  get length(){return this.a.length}
+  push(x){
+    const a=this.a;a.push(x);let i=a.length-1;
+    while(i>0){const p=(i-1)>>1;if(this.cmp(a[p],x)<=0)break;a[i]=a[p];i=p}a[i]=x;
+  }
+  pop(){
+    const a=this.a;if(!a.length)return null;
+    const root=a[0],last=a.pop();if(a.length){
+      let i=0;
+      while(true){
+        let l=i*2+1,r=l+1;if(l>=a.length)break;
+        let c=(r<a.length&&this.cmp(a[r],a[l])<0)?r:l;
+        if(this.cmp(a[c],last)>=0)break;
+        a[i]=a[c];i=c;
+      }
+      a[i]=last;
+    }
+    return root;
+  }
+}
+async function solveBoard(start){
+  const t0=performance.now(),visited=new Set(),parents=new Map();
+  let seq=0,expanded=0;
+  const rootKey=stateKey(start);
+  parents.set(rootKey,{parent:null,move:null,board:start});
+  const heap=new MinHeap((a,b)=>a.depth-b.depth||a.avail-b.avail||a.seq-b.seq);
+  heap.push({board:start,key:rootKey,depth:-countTiles(start),avail:-availableMoves(start).length,seq:seq++});
+  while(heap.length){
+    const cur=heap.pop(),b=cur.board,k=cur.key;
+    if(visited.has(k))continue;
+    if(countTiles(b)===0){
+      const moves=[],states=[];let ck=k;
+      while(ck!==null){
+        const info=parents.get(ck);states.push(info.board);
+        if(info.move)moves.push(info.move);
+        ck=info.parent;
+      }
+      moves.reverse();states.reverse();
+      return {moves,states,expanded,ms:performance.now()-t0};
+    }
+    visited.add(k);expanded++;
+    const localSeen=new Set();
+    for(const m of availableMoves(b)){
+      const nb=applyMove(b,m);if(!nb)continue;
+      const nk=stateKey(nb);
+      if(localSeen.has(nk)||visited.has(nk)||parents.has(nk))continue;
+      localSeen.add(nk);
+      const av=availableMoves(nb).length;
+      parents.set(nk,{parent:k,move:m,board:nb});
+      heap.push({board:nb,key:nk,depth:-countTiles(nb),avail:-av,seq:seq++});
+    }
+    if(expanded%20===0){
+      recognitionStatus.innerHTML=`正在计算路线……已检查 ${expanded.toLocaleString()} 个局面`;
+      await sleep(0);
+    }
+    if(expanded>250000||performance.now()-t0>45000)throw new Error('搜索时间过长，请重新截图或调整识别框后再试。');
+  }
+  throw new Error('当前识别结果没有找到通关路线。可能是网格没对齐或有图案识别错误。');
+}
+
+function sourceCellRect(i){
+  const g=lastGeom,[r,c]=rc(i);
+  return [g.x+c*g.cw,g.y+r*g.ch,g.cw,g.ch];
+}
+function drawArrow(ctx,x1,y1,x2,y2){
+  ctx.strokeStyle='#ff3131';ctx.fillStyle='#ff3131';ctx.lineWidth=7;ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+  const ang=Math.atan2(y2-y1,x2-x1),len=18;
+  ctx.beginPath();ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-len*Math.cos(ang-.55),y2-len*Math.sin(ang-.55));
+  ctx.lineTo(x2-len*Math.cos(ang+.55),y2-len*Math.sin(ang+.55));
+  ctx.closePath();ctx.fill();
+}
+function chainCells(b,m){
+  const d=moveDistance(m);if(!d)return[];
+  const [sr,sc]=rc(m.start),[er,ec]=rc(m.end),dr=Math.sign(er-sr),dc=Math.sign(ec-sc),out=[];
+  let r=sr,c=sc;
+  while(inb(r,c)&&b[idx(r,c)]!==0){out.push(idx(r,c));r+=dr;c+=dc}
+  return out;
+}
+function rectForCell(i,s){const [r,c]=rc(i);return [c*s,r*s,s,s]}
+function drawSolutionBoard(b,m){
+  const S=64;boardCanvas.width=COLS*S;boardCanvas.height=ROWS*S;
+  const c=boardCanvas.getContext('2d');c.fillStyle='#965918';c.fillRect(0,0,boardCanvas.width,boardCanvas.height);
+  for(let i=0;i<N;i++){
+    const v=b[i];if(!v)continue;
+    const rep=reps[v],[sx,sy,sw,sh]=sourceCellRect(rep),[r,col]=rc(i);
+    c.drawImage(img,sx,sy,sw,sh,col*S,r*S,S,S);
+  }
+  c.strokeStyle='rgba(255,255,255,.16)';c.lineWidth=1;
+  for(let x=0;x<=COLS;x++){c.beginPath();c.moveTo(x*S,0);c.lineTo(x*S,ROWS*S);c.stroke()}
+  for(let y=0;y<=ROWS;y++){c.beginPath();c.moveTo(0,y*S);c.lineTo(COLS*S,y*S);c.stroke()}
+  if(!m)return;
+  for(const i of chainCells(b,m)){
+    const [x,y,w,h]=rectForCell(i,S);c.strokeStyle='#ff9f1c';c.lineWidth=5;c.strokeRect(x+4,y+4,w-8,h-8);
+  }
+  let [x,y,w,h]=rectForCell(m.start,S);c.strokeStyle='#ff3131';c.lineWidth=7;c.strokeRect(x+3,y+3,w-6,h-6);
+  [x,y,w,h]=rectForCell(m.target,S);c.strokeStyle='#21a366';c.lineWidth=7;c.strokeRect(x+3,y+3,w-6,h-6);
+  const [sr,sc]=rc(m.start),[er,ec]=rc(m.end),x1=(sc+.5)*S,y1=(sr+.5)*S,x2=(ec+.5)*S,y2=(er+.5)*S;
+  if(m.start===m.end){
+    c.fillStyle='rgba(255,49,49,.25)';c.beginPath();c.arc(x1,y1,21,0,Math.PI*2);c.fill();
+    c.strokeStyle='#ff3131';c.lineWidth=6;c.beginPath();c.arc(x1,y1,18,0,Math.PI*2);c.stroke();
+  }else drawArrow(c,x1,y1,x2,y2);
+}
+function actionText(m){
+  const [sr,sc]=rc(m.start),[tr,tc]=rc(m.target),[er,ec]=rc(m.end),d=moveDistance(m);
+  if(d===0)return `点一下红框里的砖（第 ${sr+1} 行第 ${sc+1} 列）。它会和绿框里的同图案砖（第 ${tr+1} 行第 ${tc+1} 列）消除。`;
+  let dir='';if(er<sr)dir='上';else if(er>sr)dir='下';else if(ec<sc)dir='左';else dir='右';
+  return `按住红框里的砖（第 ${sr+1} 行第 ${sc+1} 列），向${dir}拖 ${d} 格。橙框里的砖会一起被推动；到位后会和绿框同图案砖消除。`;
+}
+function renderStep(){
+  const total=solutionMoves.length;
+  if(stepIndex>=total){
+    stepBadge.textContent='完成';instruction.textContent='🎉 棋盘已经按这条路线全部清空。';
+    progressBar.style.width='100%';drawSolutionBoard(solutionStates[solutionStates.length-1],null);
+    prevBtn.disabled=false;nextBtn.disabled=true;return;
+  }
+  stepBadge.textContent=`第 ${stepIndex+1} / ${total} 步`;
+  progressBar.style.width=((stepIndex)/total*100).toFixed(1)+'%';
+  const b=solutionStates[stepIndex],m=solutionMoves[stepIndex];
+  instruction.textContent=actionText(m);drawSolutionBoard(b,m);
+  prevBtn.disabled=stepIndex===0;nextBtn.disabled=false;
+}
+prevBtn.addEventListener('click',()=>{
+  if(stepIndex>0){stepIndex--;renderStep();window.scrollTo({top:solveCard.offsetTop-8,behavior:'smooth'})}
+});
+nextBtn.addEventListener('click',()=>{
+  if(stepIndex<solutionMoves.length){stepIndex++;renderStep();window.scrollTo({top:solveCard.offsetTop-8,behavior:'smooth'})}
+});
+$('restartBtn').addEventListener('click',()=>{
+  solveCard.classList.add('hide');previewCard.classList.add('hide');fileInput.value='';img=null;window.scrollTo({top:0,behavior:'smooth'});
+});
+
+solveBtn.addEventListener('click',async()=>{
+  if(!img)return;
+  solveBtn.disabled=true;recognitionStatus.classList.remove('hide');recognitionStatus.textContent='正在识别 14×10 棋盘……';
+  try{
+    const rec=await recognize();lastGeom=rec.g;initialBoard=rec.board;
+    if(rec.filled===0)throw new Error('没有识别到砖块，请检查绿色网格是否套住棋盘。');
+    if(!rec.even){
+      const sizes=rec.bad.map(x=>x.length).join('、');
+      throw new Error(`图案分组不完整（异常组大小：${sizes}）。请展开“手动微调”，让绿色网格更准确地套住每个格子后重试。`);
+    }
+    recognitionStatus.innerHTML=`<span class="ok">✓ 识别成功：</span>${rec.filled} 块砖，${rec.groups} 组图案。正在搜索完整路线……`;
+    await sleep(20);
+    const sol=await solveBoard(initialBoard);
+    solutionMoves=sol.moves;solutionStates=sol.states;stepIndex=0;
+    recognitionStatus.innerHTML=`<span class="ok">✓ 已找到完整路线：</span>${solutionMoves.length} 步，检查 ${sol.expanded.toLocaleString()} 个局面，用时 ${(sol.ms/1000).toFixed(2)} 秒。`;
+    solveCard.classList.remove('hide');renderStep();
+    setTimeout(()=>solveCard.scrollIntoView({behavior:'smooth',block:'start'}),80);
+  }catch(e){
+    recognitionStatus.innerHTML=`<span class="bad">✕ ${e.message}</span>`;
+  }finally{
+    solveBtn.disabled=false;
+  }
+});
+</script>
+</body>
+</html>
