@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v6 自学习识别版 · 不依赖固定图标模板 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v7 精确配对修正版 · 防止铃铛/稻草等相似颜色误分组 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -152,58 +152,47 @@ function groupSelfLearned(features,filled){
       const j=filled[bj],d=shiftDistance(features[i],features[j]);D[i][j]=D[j][i]=d;
     }
   }
-  const unused=new Set(filled),groups=[];
-  // Most icons occur four times. Remove only very confident mutual-nearest groups of four first.
-  while(unused.size>=4){
-    let chosen=null,bestSep=-Infinity;
-    for(const i of unused){
-      const near=nearestList(i,unused,D,3);if(near.length<3)continue;
-      const cand=new Set([i,...near.map(x=>x[1])]);if(cand.size!==4)continue;
-      let mutual=true;
-      for(const m of cand){const s2=new Set([m,...nearestList(m,unused,D,3).map(x=>x[1])]);if(!sameSet(cand,s2)){mutual=false;break}}
-      if(!mutual)continue;
-      let inside=0,outside=Infinity;
-      for(const a of cand){for(const b of cand)if(a!==b)inside=Math.max(inside,D[a][b]);for(const b of unused)if(!cand.has(b))outside=Math.min(outside,D[a][b]);}
-      const sep=(outside===Infinity?999:outside)/(inside+1e-9);
-      if(sep>bestSep){bestSep=sep;chosen=[...cand]}
-    }
-    if(!chosen)break;
-    groups.push(chosen);for(const i of chosen)unused.delete(i);
-  }
-  // A rare four-pack may miss the strict clique test. Accept a clearly separated top-4 cluster.
-  while(unused.size>=4){
-    let chosen=null,bestSep=1.65;
-    for(const i of unused){
-      const near=nearestList(i,unused,D,4);if(near.length<3)continue;
-      const cand=[i,...near.slice(0,3).map(x=>x[1])],set=new Set(cand);if(set.size!==4)continue;
-      let inside=0,outside=Infinity;
-      for(const a of set){for(const b of set)if(a!==b)inside=Math.max(inside,D[a][b]);for(const b of unused)if(!set.has(b))outside=Math.min(outside,D[a][b]);}
-      // When exactly four tiles remain, outside is Infinity. Do not merge two unrelated pairs:
-      // a real same-icon four-pack has a very small worst internal distance after shift compensation.
-      const sep=(outside===Infinity?(inside<0.025?999:0):outside/(inside+1e-9));
-      if(sep>bestSep){bestSep=sep;chosen=[...set]}
-    }
-    if(!chosen)break;
-    groups.push(chosen);for(const i of chosen)unused.delete(i);
-  }
-  // Any remaining tiles are pairs (a level may contain some icons only twice, or a four-pack may have had one pair removed already).
-  if(unused.size%2!==0)throw new Error(`自学习分组剩余 ${unused.size} 块（奇数），请重新截完整游戏画面。`);
+
+  // v7: first form the most visually similar PAIRS, then merge two pairs into a four-pack
+  // only when all four images are genuinely near-identical. This avoids confusing two yellow
+  // icons such as the bell and the straw bundle when a partial board leaves only two of each.
+  const unused=new Set(filled),pairs=[];
   while(unused.size){
-    let ba=-1,bb=-1,bd=Infinity;
-    for(const a of unused)for(const b of unused)if(a<b&&D[a][b]<bd){bd=D[a][b];ba=a;bb=b}
+    const list=[...unused];let ba=-1,bb=-1,bd=Infinity;
+    for(let x=0;x<list.length;x++)for(let y=x+1;y<list.length;y++){
+      const a=list[x],b=list[y],d=D[a][b];if(d<bd){bd=d;ba=a;bb=b}
+    }
     if(ba<0)throw new Error('自动配对失败，请重新截图后再试。');
-    groups.push([ba,bb]);unused.delete(ba);unused.delete(bb);
+    pairs.push({a:ba,b:bb,d:bd});unused.delete(ba);unused.delete(bb);
   }
-  // Recognition confidence: identical sprites should be substantially closer to their own group than to outsiders.
-  let weak=0,meanIn=0,edges=0;
-  for(const g of groups){
-    const gs=new Set(g);let inside=0,ic=0,outside=Infinity;
-    for(let a=0;a<g.length;a++)for(let b=a+1;b<g.length;b++){inside+=D[g[a]][g[b]];ic++}
-    inside=ic?inside/ic:0;meanIn+=inside;edges++;
-    for(const a of g)for(const b of filled)if(!gs.has(b))outside=Math.min(outside,D[a][b]);
-    if(outside<Infinity && outside<inside*1.12)weak++;
+
+  const pairUnused=new Set(pairs.map((_,i)=>i)),groups=[];
+  while(pairUnused.size){
+    const i=[...pairUnused][0],p=pairs[i];let bestJ=-1,bestAvg=Infinity;
+    for(const j of pairUnused){
+      if(j===i)continue;const q=pairs[j];
+      const cross=[D[p.a][q.a],D[p.a][q.b],D[p.b][q.a],D[p.b][q.b]];
+      const avg=(cross[0]+cross[1]+cross[2]+cross[3])/4,maxCross=Math.max(...cross);
+      const base=Math.max(p.d,q.d,0.001);
+      // Same sprite repeated four times stays extremely close after 1-pixel shift compensation.
+      // Different but similarly colored icons are typically > 0.02. Require both an absolute
+      // shape match and a relative match to the two internal pair distances.
+      const fourMatch=maxCross<0.0165 && avg<Math.max(0.0125,base*2.15);
+      if(fourMatch && avg<bestAvg){bestAvg=avg;bestJ=j}
+    }
+    if(bestJ>=0){
+      const q=pairs[bestJ];groups.push([p.a,p.b,q.a,q.b]);pairUnused.delete(i);pairUnused.delete(bestJ);
+    }else{
+      groups.push([p.a,p.b]);pairUnused.delete(i);
+    }
   }
-  return {groups,D,weak,meanIn:edges?meanIn/edges:0};
+
+  // Confidence check. Pairing distances can rise slightly after browser scaling, but a very large
+  // pair distance usually means two different icons were forced together. We warn rather than
+  // silently giving the user a visually wrong route.
+  let weak=0,meanIn=0,edges=0,maxPair=0;
+  for(const p of pairs){meanIn+=p.d;edges++;maxPair=Math.max(maxPair,p.d);if(p.d>0.022)weak++}
+  return {groups,D,weak,meanIn:edges?meanIn/edges:0,maxPair};
 }
 async function extractSelfFeatures(g){
   const tiny=document.createElement('canvas');tiny.width=FP;tiny.height=FP;
@@ -222,7 +211,7 @@ async function extractSelfFeatures(g){
 }
 async function recognize(){
   const g=geometry();lastGeom=g;drawPreview();
-  recognitionStatus.textContent='正在从当前截图自学习图案（不使用固定模板）……';await sleep(10);
+  recognitionStatus.textContent='正在精确配对本关图案（先配成对，再判断是否为4块同图案）……';await sleep(10);
   const {features,filled}=await extractSelfFeatures(g);
   if(!filled.length)throw new Error('没有识别到砖块，请确认上传的是完整游戏截图。');
   if(filled.length%2!==0)throw new Error(`识别到 ${filled.length} 块砖（奇数），说明棋盘定位异常。`);
