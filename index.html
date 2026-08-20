@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v9 前景特征识别版 · 用砖块四角判断空格，用图标前景形状配对 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v10 双阶段求解版 · 先用深度优先快速找通路，失败再扩大搜索 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -321,8 +321,13 @@ function candidates(b){
     if(!seen.has(k))seen.set(k,{move:m,board:nb});
   }
   const arr=[...seen.values()];
-  for(const x of arr)x.future=availableMoves(x.board).length;
-  arr.sort((a,b)=>b.future-a.future||moveDistance(a.move)-moveDistance(b.move)||a.move.start-b.move.start);
+  for(const x of arr){
+    const fm=availableMoves(x.board);
+    x.future=fm.length;
+    x.clicks=0;for(const m of fm)if(m.start===m.end)x.clicks++;
+  }
+  // 后期关卡最重要的是不要太早把棋盘推成死路。优先保留下一步选择更多、原地可消更多的局面。
+  arr.sort((a,b)=>b.future-a.future||b.clicks-a.clicks||moveDistance(a.move)-moveDistance(b.move)||a.move.start-b.move.start);
   return arr;
 }
 class MinHeap{
@@ -348,12 +353,48 @@ class MinHeap{
   }
 }
 async function solveBoard(start){
-  const t0=performance.now(),visited=new Set(),parents=new Map();
+  const totalStart=performance.now();
+
+  // v10 第一阶段：贪心深度优先。
+  // 每一步都会固定消掉2块，因此先沿“下一步选择最多”的路线一路走到底，
+  // 对后期满盘通常比把几十万个浅层局面全塞进优先队列快几个数量级。
+  let dfsNodes=0,dfsBest=countTiles(start),dfsStop=false;
+  const dead=new Set(),pathMoves=[],pathStates=[start];
+  const dfsStart=performance.now();
+
+  function dfsFast(b){
+    dfsNodes++;
+    const remain=countTiles(b);if(remain<dfsBest)dfsBest=remain;
+    if(remain===0)return true;
+    if(dfsNodes>30000||performance.now()-dfsStart>8000){dfsStop=true;return false;}
+    const k=stateKey(b);if(dead.has(k))return false;
+    const cs=candidates(b);
+    if(!cs.length){dead.add(k);return false;}
+    for(const ch of cs){
+      pathMoves.push(ch.move);pathStates.push(ch.board);
+      if(dfsFast(ch.board))return true;
+      pathMoves.pop();pathStates.pop();
+      if(dfsStop)return false;
+    }
+    dead.add(k);return false;
+  }
+
+  recognitionStatus.innerHTML='正在快速寻找通关路线……';
+  await sleep(0);
+  if(dfsFast(start)){
+    return {moves:pathMoves.slice(),states:pathStates.slice(),expanded:dfsNodes,ms:performance.now()-totalStart,mode:'DFS'};
+  }
+
+  // 第二阶段：如果快速深搜没直接命中，再用原来的最佳优先搜索扩大范围。
+  recognitionStatus.innerHTML=`快速搜索检查了 ${dfsNodes.toLocaleString()} 个局面（最好剩 ${dfsBest} 块），正在扩大搜索范围……`;
+  await sleep(0);
+  const visited=new Set(),parents=new Map();
   let seq=0,expanded=0,bestRemain=countTiles(start);
   const rootKey=stateKey(start);
   parents.set(rootKey,{parent:null,move:null,board:start});
   const heap=new MinHeap((a,b)=>a.remain-b.remain||a.avail-b.avail||a.seq-b.seq);
   heap.push({board:start,key:rootKey,remain:countTiles(start),avail:-availableMoves(start).length,seq:seq++});
+  const fallbackStart=performance.now();
   while(heap.length){
     const cur=heap.pop(),b=cur.board,k=cur.key;
     if(visited.has(k))continue;
@@ -365,7 +406,7 @@ async function solveBoard(start){
         ck=info.parent;
       }
       moves.reverse();states.reverse();
-      return {moves,states,expanded,ms:performance.now()-t0};
+      return {moves,states,expanded:dfsNodes+expanded,ms:performance.now()-totalStart,mode:'GBFS'};
     }
     visited.add(k);expanded++;if(cur.remain<bestRemain)bestRemain=cur.remain;
     const localSeen=new Set();
@@ -374,19 +415,20 @@ async function solveBoard(start){
       const nk=stateKey(nb);
       if(localSeen.has(nk)||visited.has(nk)||parents.has(nk))continue;
       localSeen.add(nk);
-      const av=availableMoves(nb).length;
+      const fm=availableMoves(nb),av=fm.length;
       parents.set(nk,{parent:k,move:m,board:nb});
       heap.push({board:nb,key:nk,remain:countTiles(nb),avail:-av,seq:seq++});
     }
-    if(expanded%20===0){
-      recognitionStatus.innerHTML=`正在计算路线……已检查 ${expanded.toLocaleString()} 个局面，当前最好剩 ${bestRemain} 块`;
+    if(expanded%25===0){
+      recognitionStatus.innerHTML=`扩大搜索中……共检查 ${(dfsNodes+expanded).toLocaleString()} 个局面，当前最好剩 ${Math.min(dfsBest,bestRemain)} 块`;
       await sleep(0);
     }
-    if(expanded>250000||performance.now()-t0>60000)throw new Error(`求解超过60秒（已检查 ${expanded.toLocaleString()} 个局面，最好剩 ${bestRemain} 块）。这通常表示图案分组仍有歧义，而不是手机分辨率问题。`);
+    if(expanded>180000||performance.now()-fallbackStart>52000){
+      throw new Error(`求解仍未完成（共检查 ${(dfsNodes+expanded).toLocaleString()} 个局面，最好剩 ${Math.min(dfsBest,bestRemain)} 块）。如果最好只剩2~4块，说明已经非常接近成功，可能是搜索分支过深，也可能是少数图案被分错组；把这一行结果截给我即可继续定位。`);
+    }
   }
-  throw new Error('当前识别结果没有找到通关路线。可能是网格没对齐或有图案识别错误。');
+  throw new Error('当前识别结果没有找到通关路线。可能有少数图案被错误配对。');
 }
-
 function sourceCellRect(i){
   const g=lastGeom,[r,c]=rc(i);
   return [g.x+c*g.cw,g.y+r*g.ch,g.cw,g.ch];
