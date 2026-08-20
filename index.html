@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="theme-color" content="#19a66a">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>砖了个砖助手 V16</title>
+<title>砖了个砖助手 V17</title>
 <style>
 :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;color:#15231d;background:#eef7f2}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(#eaf8f1,#f7faf8);min-height:100vh}
@@ -54,7 +54,7 @@ canvas{display:block;width:100%;height:auto;border-radius:12px;background:#8e541
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v16 全自动稳定版 · 288种完整砖块图库 + 同局像素自校验 · 不需要人工逐个配对</div>
+  <div class="foot">v17 连消剪枝高速版 · 288种完整砖块图库 + 强制连消剪枝 + 多路线求解 · 不会无限循环</div>
 </div>
 <script>
 'use strict';
@@ -199,7 +199,7 @@ function makeCandidates(rec){
     if(reopen)for(const j of cells){fixed.delete(j);amb.add(j)}
   }
   const ambCells=[...amb];if(ambCells.length%2)throw new Error('自动校验后仍有奇数个不确定砖块，请重新截原始游戏图。');
-  const pairings=bestPairing(ambCells,D,loc,8),cands=[];
+  const pairings=bestPairing(ambCells,D,loc,16),cands=[];
   for(const pp of pairings){
     const board=Array(N).fill(0),localReps={},keyMap=new Map();let gid=1;
     for(const i of filled){
@@ -277,83 +277,124 @@ function applyMove(b,m){
   return a;
 }
 function moveDistance(m){const [a,b]=rc(m.start),[c,d]=rc(m.end);return Math.abs(a-c)+Math.abs(b-d)}
-function nextCandidates(b){
+// V17: 先自动清掉所有“无需移动就能配对”的砖。删除同图案砖只会增加空位，
+// 不会堵住后续路线，因此把这部分从搜索树里拿掉，可以把分支数压低几个数量级。
+function firstDirectMove(b){
+  for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
+    const s=idx(r,c),t=b[s];if(!t)continue;
+    let ep=nearest(b,r,c,'right');if(ep>=0&&b[ep]===t)return {start:s,end:s,search:'right',target:ep};
+    ep=nearest(b,r,c,'down');if(ep>=0&&b[ep]===t)return {start:s,end:s,search:'down',target:ep};
+  }
+  return null;
+}
+function closeForced(b){
+  const moves=[],states=[];let guard=0;
+  while(guard++<80){
+    const m=firstDirectMove(b);if(!m)return {board:b,moves,states};
+    const nb=applyMove(b,m);if(!nb)return {board:b,moves,states};
+    b=nb;moves.push(m);states.push(b);
+  }
+  return {board:b,moves,states};
+}
+function branchMoves(b){
+  // 经过 closeForced 后不应该再有 0 格点击，这里只保留真正需要拖动的动作。
+  return availableMoves(b).filter(m=>m.start!==m.end);
+}
+function macroCandidates(b){
   const seen=new Map();
-  for(const m of availableMoves(b)){
-    const nb=applyMove(b,m);if(!nb)continue;const k=stateKey(nb);if(!seen.has(k))seen.set(k,{move:m,board:nb});
+  for(const m of branchMoves(b)){
+    const nb=applyMove(b,m);if(!nb)continue;
+    const cl=closeForced(nb),k=stateKey(cl.board);
+    if(seen.has(k))continue;
+    seen.set(k,{move:m,board:cl.board,moves:[m,...cl.moves],states:[nb,...cl.states],forced:cl.moves.length});
   }
   const arr=[...seen.values()];
-  for(const x of arr){
-    const fm=availableMoves(x.board);x.future=fm.length;x.clicks=0;const types=new Set();
-    for(const m of fm){if(m.start===m.end)x.clicks++;const t=x.board[m.start];if(t)types.add(t)}
-    x.types=types.size;x.score=x.clicks*12+x.types*6+Math.min(x.future,100);
-  }
-  arr.sort((a,b)=>b.score-a.score||b.clicks-a.clicks||b.future-a.future||moveDistance(a.move)-moveDistance(b.move));
+  for(const x of arr){x.remain=countTiles(x.board);x.future=branchMoves(x.board).length}
+  // 先看剩余砖数，再奖励“这一拖之后自动连消更多”的路线，最后看后续可动性。
+  arr.sort((a,b)=>a.remain-b.remain||b.forced-a.forced||b.future-a.future||moveDistance(a.move)-moveDistance(b.move));
   return arr;
 }
 function makeRng(seed){let x=(seed|0)||0x12345678;return()=>{x^=x<<13;x^=x>>>17;x^=x<<5;return (x>>>0)/4294967296}}
 function hashSeed(b){let h=2166136261>>>0;for(const x of b){h^=x;h=Math.imul(h,16777619)>>>0}return h>>>0}
-async function randomGreedySolve(start,{maxAttempts=220,maxMs=7000,statusPrefix=''}={}){
-  const t0=performance.now(),seed0=hashSeed(start);let bestRemain=countTiles(start),evaluated=0;
+async function macroRandomSolve(start,{maxAttempts=800,maxMs=3500,statusPrefix='',yieldEvery=16}={}){
+  const t0=performance.now(),pre=closeForced(start),root=pre.board,seed0=hashSeed(root);
+  let bestRemain=countTiles(root),evaluated=0;
+  if(bestRemain===0)return {solved:true,moves:pre.moves,states:[start,...pre.states],expanded:0,ms:performance.now()-t0,mode:'强制连消'};
   for(let attempt=0;attempt<maxAttempts&&performance.now()-t0<maxMs;attempt++){
-    const rng=makeRng((seed0+Math.imul(attempt+1,0x9e3779b1))|0),states=[start],movesPath=[];let b=start,failed=false;
-    while(countTiles(b)>0){
-      const cs=nextCandidates(b);evaluated+=cs.length;if(!cs.length){failed=true;break}
-      const rem=countTiles(b)-2;if(rem<bestRemain)bestRemain=rem;
-      let pick=0;
-      if(attempt>0){
-        const k=Math.min(cs.length,4+(attempt%3)),best=cs[0].score,temp=18+(attempt%5)*3;let sum=0;const w=[];
-        for(let i=0;i<k;i++){const z=Math.exp((cs[i].score-best)/temp);w.push(z);sum+=z}
-        let q=rng()*sum;for(pick=0;pick<k-1;pick++){q-=w[pick];if(q<=0)break}
+    const rng=makeRng((seed0+Math.imul(attempt+1,0x9e3779b1))|0);
+    let b=root,guard=0;const pathMoves=[...pre.moves],pathStates=[start,...pre.states];
+    while(countTiles(b)>0&&guard++<70){
+      const cs=macroCandidates(b);evaluated+=cs.length;if(!cs.length)break;
+      bestRemain=Math.min(bestRemain,cs[0].remain);
+      const k=Math.min(cs.length,Math.min(8,2+(attempt%7)));
+      const scores=[],best=cs[0];let maxScore=-Infinity;
+      for(let i=0;i<k;i++){
+        const sc=-cs[i].remain*50+cs[i].forced*12+cs[i].future*1.5-(moveDistance(cs[i].move)*0.15);
+        scores.push(sc);if(sc>maxScore)maxScore=sc;
       }
-      const ch=cs[pick];movesPath.push(ch.move);b=ch.board;states.push(b);
-      if(states.length>80){failed=true;break}
+      let sum=0;const w=[];for(let i=0;i<k;i++){const z=Math.exp((scores[i]-maxScore)/18);w.push(z);sum+=z}
+      let q=rng()*sum,pick=0;for(;pick<k-1;pick++){q-=w[pick];if(q<=0)break}
+      const ch=cs[pick];pathMoves.push(...ch.moves);pathStates.push(...ch.states);b=ch.board;
     }
-    if(!failed&&countTiles(b)===0)return {solved:true,moves:movesPath,states,expanded:evaluated,ms:performance.now()-t0,mode:`随机贪心第${attempt+1}次`};
-    if(attempt%10===9){recognitionStatus.innerHTML=`${statusPrefix}<br>正在多路线试探……第 ${attempt+1} 次，当前最好剩 ${bestRemain} 块`;await sleep(0)}
+    if(countTiles(b)===0)return {solved:true,moves:pathMoves,states:pathStates,expanded:evaluated,ms:performance.now()-t0,mode:`连消随机路线 ${attempt+1}`};
+    if(attempt%yieldEvery===yieldEvery-1){
+      recognitionStatus.innerHTML=`${statusPrefix}<br>正在快速换路线……已试 ${attempt+1} 条，当前最好剩 ${bestRemain} 块`;
+      await sleep(0);
+    }
   }
-  return {solved:false,bestRemain,expanded:evaluated,ms:performance.now()-t0,mode:'随机贪心'};
+  return {solved:false,bestRemain,expanded:evaluated,ms:performance.now()-t0,mode:'连消随机路线'};
 }
 class MinHeap{
   constructor(cmp){this.a=[];this.cmp=cmp}get length(){return this.a.length}
   push(x){const a=this.a;a.push(x);let i=a.length-1;while(i>0){const p=(i-1)>>1;if(this.cmp(a[p],x)<=0)break;a[i]=a[p];i=p}a[i]=x}
   pop(){const a=this.a;if(!a.length)return null;const root=a[0],last=a.pop();if(a.length){let i=0;while(true){let l=i*2+1,r=l+1;if(l>=a.length)break;let c=(r<a.length&&this.cmp(a[r],a[l])<0)?r:l;if(this.cmp(a[c],last)>=0)break;a[i]=a[c];i=c}a[i]=last}return root}
 }
-async function gbfsSolve(start,{maxExpanded=90000,maxMs=22000,statusPrefix=''}={}){
-  const t0=performance.now(),visited=new Set(),parents=new Map();let seq=0,expanded=0,bestRemain=countTiles(start);
-  const rootKey=stateKey(start);parents.set(rootKey,{parent:null,move:null,board:start});
-  const heap=new MinHeap((a,b)=>a.remain-b.remain||a.avail-b.avail||a.seq-b.seq);
-  heap.push({board:start,key:rootKey,remain:countTiles(start),avail:-availableMoves(start).length,seq:seq++});
-  while(heap.length){
-    const cur=heap.pop(),b=cur.board,k=cur.key;if(visited.has(k))continue;
-    if(cur.remain===0){const moves=[],states=[];let ck=k;while(ck!==null){const info=parents.get(ck);states.push(info.board);if(info.move)moves.push(info.move);ck=info.parent}moves.reverse();states.reverse();return {solved:true,moves,states,expanded,ms:performance.now()-t0,mode:'GBFS'}}
-    visited.add(k);expanded++;bestRemain=Math.min(bestRemain,cur.remain);
-    for(const ch of nextCandidates(b)){const nb=ch.board,nk=stateKey(nb);if(visited.has(nk)||parents.has(nk))continue;parents.set(nk,{parent:k,move:ch.move,board:nb});heap.push({board:nb,key:nk,remain:countTiles(nb),avail:-ch.future,seq:seq++})}
-    if(expanded%40===0){recognitionStatus.innerHTML=`${statusPrefix}<br>GBFS兜底搜索……已检查 ${expanded.toLocaleString()} 个局面，最好剩 ${bestRemain} 块`;await sleep(0)}
-    if(expanded>=maxExpanded||performance.now()-t0>=maxMs)break;
+async function macroGbfsSolve(start,{maxExpanded=30000,maxMs=5000,statusPrefix=''}={}){
+  const t0=performance.now(),pre=closeForced(start),root=pre.board,visited=new Set(),parents=new Map();
+  let seq=0,expanded=0,bestRemain=countTiles(root),bestKey=stateKey(root);
+  if(bestRemain===0)return {solved:true,moves:pre.moves,states:[start,...pre.states],expanded:0,ms:0,mode:'强制连消'};
+  const rootKey=stateKey(root);parents.set(rootKey,{parent:null,macroMoves:null,macroStates:null,board:root});
+  const heap=new MinHeap((a,b)=>a.remain-b.remain||b.future-a.future||a.seq-b.seq);
+  heap.push({board:root,key:rootKey,remain:bestRemain,future:branchMoves(root).length,seq:seq++});
+  while(heap.length&&expanded<maxExpanded&&performance.now()-t0<maxMs){
+    const cur=heap.pop();if(visited.has(cur.key))continue;visited.add(cur.key);expanded++;
+    if(cur.remain<bestRemain){bestRemain=cur.remain;bestKey=cur.key}
+    if(cur.remain===0){bestKey=cur.key;break}
+    for(const ch of macroCandidates(cur.board)){
+      const nk=stateKey(ch.board);if(visited.has(nk)||parents.has(nk))continue;
+      parents.set(nk,{parent:cur.key,macroMoves:ch.moves,macroStates:ch.states,board:ch.board});
+      heap.push({board:ch.board,key:nk,remain:ch.remain,future:ch.future,seq:seq++});
+    }
+    if(expanded%120===0){recognitionStatus.innerHTML=`${statusPrefix}<br>最后兜底搜索……已检查 ${expanded.toLocaleString()} 个压缩局面，最好剩 ${bestRemain} 块`;await sleep(0)}
   }
-  return {solved:false,bestRemain,expanded,ms:performance.now()-t0,mode:'GBFS'};
+  const goalSolved=bestRemain===0;
+  if(goalSolved){
+    const parts=[];let k=bestKey;
+    while(parents.get(k)?.parent!==null){const p=parents.get(k);parts.push([p.macroMoves,p.macroStates]);k=p.parent}
+    parts.reverse();const moves=[...pre.moves],states=[start,...pre.states];for(const [mm,ss] of parts){moves.push(...mm);states.push(...ss)}
+    return {solved:true,moves,states,expanded,ms:performance.now()-t0,mode:'压缩GBFS'};
+  }
+  return {solved:false,bestRemain,expanded,ms:performance.now()-t0,mode:'压缩GBFS'};
 }
 async function solveOneBoard(start,statusPrefix,fast=false){
-  const r=await randomGreedySolve(start,{maxAttempts:fast?45:260,maxMs:fast?1400:8500,statusPrefix});if(r.solved)return r;
-  if(fast)return r;
-  const g=await gbfsSolve(start,{maxExpanded:110000,maxMs:26000,statusPrefix});
-  if(g.solved)return g;return (g.bestRemain<=r.bestRemain)?g:r;
+  // 正确分组通常几十到几百次随机路线内就能过；错误分组不再无止境搜。
+  const r=await macroRandomSolve(start,{maxAttempts:fast?100:1600,maxMs:fast?700:6000,statusPrefix,yieldEvery:16});
+  if(r.solved)return r;if(fast)return r;
+  const g=await macroGbfsSolve(start,{maxExpanded:35000,maxMs:6000,statusPrefix});
+  return g.solved?g:((g.bestRemain<=r.bestRemain)?g:r);
 }
 async function solveRecognized(rec){
   if(!rec.candidates.length)throw new Error('没有生成可用的图案分组候选。');
-  let best=null,total=0;
-  const shortlist=rec.candidates.slice(0,Math.min(12,rec.candidates.length));
-  if(shortlist.length===1){const r=await solveOneBoard(shortlist[0].board,lastRecognitionSummary,false);return {result:r,candidate:shortlist[0],totalExpanded:r.expanded}}
+  const shortlist=rec.candidates.slice(0,Math.min(16,rec.candidates.length));let total=0,best=null;
   for(let i=0;i<shortlist.length;i++){
-    recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>正在验证图案候选 ${i+1}/${shortlist.length}……`;
+    recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>快速验证图案候选 ${i+1}/${shortlist.length}……`;
     const r=await solveOneBoard(shortlist[i].board,lastRecognitionSummary,true);total+=r.expanded;
     if(r.solved)return {result:r,candidate:shortlist[i],totalExpanded:total};
     if(!best||r.bestRemain<best.result.bestRemain||(r.bestRemain===best.result.bestRemain&&shortlist[i].cost<best.candidate.cost))best={result:r,candidate:shortlist[i]};
   }
-  // 对最接近成功的候选做一次完整双阶段搜索。
   const finalists=[best?.candidate,...shortlist.filter(x=>x!==best?.candidate)].filter(Boolean).slice(0,3);
   for(let i=0;i<finalists.length;i++){
+    recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>候选 ${i+1}/${finalists.length} 进入深度验证……`;
     const r=await solveOneBoard(finalists[i].board,lastRecognitionSummary,false);total+=r.expanded;
     if(r.solved)return {result:r,candidate:finalists[i],totalExpanded:total};
     if(!best||r.bestRemain<best.result.bestRemain)best={result:r,candidate:finalists[i]};
@@ -433,21 +474,13 @@ solveBtn.addEventListener('click',async()=>{
   try{
     const rec=await extractBoard();await sleep(10);const cands=makeCandidates(rec);
     if(!cands.length)throw new Error('没有生成安全的自动分组。');
-    lastRecognitionSummary=`<span class="ok">✓ V16全自动识别：</span>${rec.filled.length} 块砖；完整图库 288 种；自动生成 ${cands.length} 套安全分组候选。`;
+    lastRecognitionSummary=`<span class="ok">✓ V17全自动识别：</span>${rec.filled.length} 块砖；完整图库 288 种；自动生成 ${cands.length} 套安全分组候选。`;
     recognitionStatus.innerHTML=lastRecognitionSummary+'<br>正在逐套验证，只有能完整清盘的结果才会显示……';
-    let solved=null,total=0,bestFail=null;
-    for(let i=0;i<cands.length;i++){
-      recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>正在验证自动分组 ${i+1}/${cands.length}……`;
-      const r=await solveOneBoard(cands[i].board,lastRecognitionSummary,i<3);total+=r.expanded;
-      if(r.solved){solved={r,c:cands[i]};break}
-      if(!bestFail||r.bestRemain<bestFail.r.bestRemain)bestFail={r,c:cands[i]};
-    }
-    if(!solved){
-      const r=await solveOneBoard(cands[0].board,lastRecognitionSummary,false);total+=r.expanded;
-      if(r.solved)solved={r,c:cands[0]};else throw new Error(`自动安全模式未找到完整解（最好剩 ${r.bestRemain} 块）。为了不出错，本次不会给错误路线；请重新截一张游戏原始截图再试。`);
-    }
-    reps=solved.c.reps;initialBoard=solved.c.board;solutionMoves=solved.r.moves;solutionStates=solved.r.states;stepIndex=0;
-    recognitionStatus.innerHTML=`${lastRecognitionSummary}<br><span class="ok">✓ 已通过完整清盘验证：</span>${solutionMoves.length} 步；其中 ${solved.c.strong} 块由完整图库直接确认，${solved.c.amb} 块由当前棋盘像素自动配对；无需人工选择。`;
+    const solvedPack=await solveRecognized({candidates:cands});
+    const r=solvedPack.result,c=solvedPack.candidate;
+    if(!r.solved)throw new Error(`已自动换过多条路线和图案候选，但仍没有完整解（最好剩 ${r.bestRemain} 块）。V17已停止搜索，不会继续循环；这通常说明少数图标识别仍有歧义。`);
+    reps=c.reps;initialBoard=c.board;solutionMoves=r.moves;solutionStates=r.states;stepIndex=0;
+    recognitionStatus.innerHTML=`${lastRecognitionSummary}<br><span class="ok">✓ 已通过完整清盘验证：</span>${solutionMoves.length} 步；${r.mode}，共检查 ${solvedPack.totalExpanded.toLocaleString()} 个候选动作/局面。`;
     solveCard.classList.remove('hide');renderStep();setTimeout(()=>solveCard.scrollIntoView({behavior:'smooth',block:'start'}),80);
   }catch(e){recognitionStatus.innerHTML=`${lastRecognitionSummary?lastRecognitionSummary+'<br>':''}<span class="bad">✕ ${e.message}</span>`}
   finally{solveBtn.disabled=false}
