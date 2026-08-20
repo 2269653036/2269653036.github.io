@@ -62,7 +62,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v12 固定模板 + 增量学习版 · 内置40种已见图标，新图标只学习一次 · 随机贪心多路试探 + GBFS兜底 · 全程本机处理</div>
+  <div class="foot">v13 相似图标二次判别版 · 内置40种已见图标，新图标只学习一次 · 随机贪心多路试探 + GBFS兜底 · 全程本机处理</div>
 </div>
 <script>
 'use strict';
@@ -156,6 +156,26 @@ function shiftDistance(a,b){
   }
   return best;
 }
+// V13: 二次细节距离。V12 的粗距离更看重整体轮廓，像“麻袋/种子袋”这种
+// 外形接近但中心图案不同的图标容易混。这里提高中心区域和颜色细节权重。
+function detailDistance(a,b){
+  let best=Infinity;
+  for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+    const y0=Math.max(0,dy),y1=Math.min(FP,FP+dy),x0=Math.max(0,dx),x1=Math.min(FP,FP+dx);
+    let sum=0,ws=0;
+    for(let yy=y0;yy<y1;yy++)for(let xx=x0;xx<x1;xx++){
+      const ia=(yy*FP+xx)*FC,ib=((yy-dy)*FP+(xx-dx))*FC;
+      const center=(yy>=3&&yy<13&&xx>=3&&xx<13),w=center?2.5:0.5;
+      let d=a[ia]-b[ib];sum+=w*0.35*d*d;
+      d=a[ia+1]-b[ib+1];sum+=w*(0.2166667*d*d);
+      d=a[ia+2]-b[ib+2];sum+=w*(0.2166667*d*d);
+      d=a[ia+3]-b[ib+3];sum+=w*(0.2166667*d*d);
+      ws+=w;
+    }
+    const v=sum/Math.max(ws,1e-9);if(v<best)best=v;
+  }
+  return best;
+}
 function loadIconLibrary(){
   const lib=[];
   for(const [name,samples] of Object.entries(SEED_LIBRARY))lib.push({key:'seed:'+name,name,samples:samples.map(decodeFeature),seed:true});
@@ -213,38 +233,89 @@ async function extractSelfFeatures(g){
 }
 function categoryScores(f){
   const out=[];
-  for(const cat of iconLibrary){let d=Infinity;for(const t of cat.samples)d=Math.min(d,shiftDistance(f,t));out.push({key:cat.key,d,cat})}
+  for(const cat of iconLibrary){
+    let coarse=Infinity,detail=Infinity;
+    for(const t of cat.samples){
+      coarse=Math.min(coarse,shiftDistance(f,t));
+      detail=Math.min(detail,detailDistance(f,t));
+    }
+    // 粗轮廓用于稳定大类，中心细节用于拆开外形相近的图标。
+    const score=0.35*coarse+0.65*detail;
+    out.push({key:cat.key,d:score,coarse,detail,cat});
+  }
   out.sort((a,b)=>a.d-b.d);return out;
+}
+function bestPairCategory(features,pair){
+  const per=pair.map(i=>categoryScores(features[i]));
+  const keys=new Set();for(const s of per)for(const x of s.slice(0,5))keys.add(x.key);
+  let best=null;
+  for(const key of keys){
+    let sum=0,detail=0,ok=true;
+    for(const s of per){const x=s.find(z=>z.key===key);if(!x){ok=false;break}sum+=x.d;detail+=x.detail}
+    if(!ok)continue;
+    const v={key,d:sum/pair.length,detail:detail/pair.length};if(!best||v.d<best.d)best=v;
+  }
+  return best;
+}
+function repairMixedKnownGroups(features,assigned,meta){
+  // 同一截图里，同一种图标的重复砖应当非常相像。若某个“4块已知类”实际上由
+  // 两对视觉差异明显的图标组成，就按两对分别重新认一次。专门解决麻袋/种子袋等碰撞。
+  const by=new Map();for(const [i,k] of assigned){if(!by.has(k))by.set(k,[]);by.get(k).push(i)}
+  let repaired=0;
+  for(const [key,cells] of by){
+    if(cells.length!==4)continue;
+    const [a,b,c,d]=cells;
+    const parts=[[[a,b],[c,d]],[[a,c],[b,d]],[[a,d],[b,c]]];
+    let best=null;
+    for(const pp of parts){
+      const d1=detailDistance(features[pp[0][0]],features[pp[0][1]]),d2=detailDistance(features[pp[1][0]],features[pp[1][1]]);
+      const v=d1+d2;if(!best||v<best.v)best={pairs:pp,v,d1,d2};
+    }
+    const p1=bestPairCategory(features,best.pairs[0]),p2=bestPairCategory(features,best.pairs[1]);
+    if(!p1||!p2||p1.key===p2.key)continue;
+    // 两个对子自身必须够像，并且各自对另一类别有明确收益，才允许拆分，避免把真4块误拆。
+    const keep=best.pairs.flat().reduce((s,i)=>{const x=categoryScores(features[i]).find(z=>z.key===key);return s+(x?x.d:1)},0)/4;
+    const split=(p1.d+p2.d)/2;
+    const tight=Math.max(best.d1,best.d2)<0.024;
+    if(tight&&split+0.003<keep){
+      for(const i of best.pairs[0]){assigned.set(i,p1.key);meta.set(i,{...(meta.get(i)||{}),best:p1.key,repaired:true})}
+      for(const i of best.pairs[1]){assigned.set(i,p2.key);meta.set(i,{...(meta.get(i)||{}),best:p2.key,repaired:true})}
+      repaired++;
+    }
+  }
+  return repaired;
 }
 function classifyKnown(features,filled){
   const assigned=new Map(),meta=new Map(),unknown=[];
   for(let n=0;n<filled.length;n++){
     const i=filled[n],s=categoryScores(features[i]),a=s[0],b=s[1]||{d:Infinity};
     const ratio=a.d/Math.max(b.d,1e-7);
-    // 固定模板只在足够像时才认领；宁可把可疑格留给“新图标配对”，也不强行认错。
-    const strong=a.d<0.050 && (a.d<0.028||ratio<0.88);
-    if(strong){assigned.set(i,a.key);meta.set(i,{d:a.d,ratio,best:a.key})}else{unknown.push(i);meta.set(i,{d:a.d,ratio,best:a.key})}
-    if(n%16===0)recognitionStatus.textContent=`正在用固定模板识别……${n+1}/${filled.length}`;
+    // V13：组合距离比V12更能看清中心图案；仍然宁可保留未知，也不强行认错。
+    const strong=a.d<0.044 && (a.d<0.026||ratio<0.90);
+    if(strong){assigned.set(i,a.key);meta.set(i,{d:a.d,ratio,best:a.key,detail:a.detail,coarse:a.coarse})}
+    else{unknown.push(i);meta.set(i,{d:a.d,ratio,best:a.key,detail:a.detail,coarse:a.coarse})}
+    if(n%16===0)recognitionStatus.textContent=`正在做中心细节二次识别……${n+1}/${filled.length}`;
   }
-  // 每一种真实图标的剩余数量必为偶数。若某个已知类别暂时成奇数，先尝试从“未认领”里补回它；
-  // 补不到就撤掉该类里最不确定的一格，让它进入新图标配对池。
+  const repaired=repairMixedKnownGroups(features,assigned,meta);
+  // 每一种真实图标的剩余数量必为偶数。若某个已知类别暂时成奇数，优先从未知池补回；
+  // 补不到则撤掉该类最不确定的一格，交给后续新图标配对。
   const count=()=>{const m=new Map();for(const k of assigned.values())m.set(k,(m.get(k)||0)+1);return m};
-  for(let pass=0;pass<3;pass++){
+  for(let pass=0;pass<4;pass++){
     let changed=false;const cnt=count();
     for(const [key,n] of cnt)if(n%2){
       let bi=-1,bd=Infinity;
-      for(const i of unknown){const s=categoryScores(features[i]),hit=s.find(x=>x.key===key);if(hit&&hit.d<0.062&&hit.d<bd){bd=hit.d;bi=i}}
-      if(bi>=0){assigned.set(bi,key);const p=unknown.indexOf(bi);if(p>=0)unknown.splice(p,1);changed=true;continue}
+      for(const i of unknown){const s=categoryScores(features[i]),hit=s.find(x=>x.key===key);if(hit&&hit.d<0.054&&hit.d<bd){bd=hit.d;bi=i}}
+      if(bi>=0){assigned.set(bi,key);meta.set(bi,{...(meta.get(bi)||{}),d:bd,best:key});const p=unknown.indexOf(bi);if(p>=0)unknown.splice(p,1);changed=true;continue}
       let wi=-1,wd=-1;for(const [i,k] of assigned)if(k===key){const d=meta.get(i)?.d||0;if(d>wd){wd=d;wi=i}}
       if(wi>=0){assigned.delete(wi);unknown.push(wi);changed=true}
     }
     if(!changed)break;
   }
-  return {assigned,unknown,meta};
+  return {assigned,unknown,meta,repaired};
 }
 function unknownDistanceMatrix(features,unknown){
   const M=unknown.length,D=Array.from({length:M},()=>new Float32Array(M));
-  for(let a=0;a<M;a++){D[a][a]=Infinity;for(let b=a+1;b<M;b++)D[a][b]=D[b][a]=shiftDistance(features[unknown[a]],features[unknown[b]]);}
+  for(let a=0;a<M;a++){D[a][a]=Infinity;for(let b=a+1;b<M;b++)D[a][b]=D[b][a]=detailDistance(features[unknown[a]],features[unknown[b]]);}
   return D;
 }
 function greedyPairing(unknown,D){
@@ -270,7 +341,7 @@ function pairingHypotheses(unknown,features,limit=24){
 }
 function mergeConfidentPairs(pairs,features){
   const used=new Set(),groups=[];
-  const pd=(a,b)=>{const p=pairs[a],q=pairs[b];return (shiftDistance(features[p[0]],features[q[0]])+shiftDistance(features[p[0]],features[q[1]])+shiftDistance(features[p[1]],features[q[0]])+shiftDistance(features[p[1]],features[q[1]]))/4};
+  const pd=(a,b)=>{const p=pairs[a],q=pairs[b];return (detailDistance(features[p[0]],features[q[0]])+detailDistance(features[p[0]],features[q[1]])+detailDistance(features[p[1]],features[q[0]])+detailDistance(features[p[1]],features[q[1]]))/4};
   for(let i=0;i<pairs.length;i++){
     if(used.has(i))continue;let best=-1,bd=Infinity,second=Infinity;
     for(let j=0;j<pairs.length;j++)if(j!==i&&!used.has(j)){const d=pd(i,j);if(d<bd){second=bd;bd=d;best=j}else if(d<second)second=d}
@@ -298,22 +369,22 @@ function recognitionCandidates(features,filled){
     if(merged.some(g=>g.length===4))cands.push(makeBoardCandidate(k.assigned,merged,p.cost-0.002*merged.filter(g=>g.length===4).length,p.maxPair));
   }
   const seen=new Set(),uniq=[];for(const c of cands.sort((a,b)=>a.cost-b.cost)){const key=stateKey(c.board);if(!seen.has(key)){seen.add(key);uniq.push(c)}}
-  return {assigned:k.assigned,unknown:k.unknown,candidates:uniq.slice(0,24)};
+  return {assigned:k.assigned,unknown:k.unknown,candidates:uniq.slice(0,24),repaired:k.repaired||0};
 }
 function learnUnknownGroups(groups,features){
   if(!groups||!groups.length)return 0;
   // 求解成功后再学习。先把视觉上明显属于同一图标的两个“对子”重新并到一起，避免把一个4块图标永久记成两个类别。
   let clusters=groups.map(g=>g.slice()),changed=true;
   while(changed){changed=false;outer:for(let a=0;a<clusters.length;a++)for(let b=a+1;b<clusters.length;b++){
-    let sum=0,n=0;for(const i of clusters[a])for(const j of clusters[b]){sum+=shiftDistance(features[i],features[j]);n++}
+    let sum=0,n=0;for(const i of clusters[a])for(const j of clusters[b]){sum+=detailDistance(features[i],features[j]);n++}
     if(n&&sum/n<0.024){clusters[a]=clusters[a].concat(clusters[b]);clusters.splice(b,1);changed=true;break outer}
   }}
   const saved=learnedCatsRaw();let added=0;
   for(const cl of clusters){
-    let bestExisting=Infinity;for(const cat of iconLibrary)for(const i of cl)for(const t of cat.samples)bestExisting=Math.min(bestExisting,shiftDistance(features[i],t));
+    let bestExisting=Infinity;for(const cat of iconLibrary)for(const i of cl)for(const t of cat.samples)bestExisting=Math.min(bestExisting,detailDistance(features[i],t));
     if(bestExisting<0.042)continue;
     // 选最多2张代表图作为本机模板。
-    const picks=[cl[0]];if(cl.length>1){let bi=cl[1],bd=-1;for(const i of cl.slice(1)){const d=shiftDistance(features[cl[0]],features[i]);if(d>bd){bd=d;bi=i}}picks.push(bi)}
+    const picks=[cl[0]];if(cl.length>1){let bi=cl[1],bd=-1;for(const i of cl.slice(1)){const d=detailDistance(features[cl[0]],features[i]);if(d>bd){bd=d;bi=i}}picks.push(bi)}
     saved.push({key:'learned:'+Date.now().toString(36)+':'+saved.length,name:'自学图标',samples:picks.slice(0,2).map(i=>encodeFeature(features[i]))});added++;
   }
   if(added){try{localStorage.setItem(LIB_KEY,JSON.stringify({cats:saved.slice(-80)}))}catch(e){console.warn('save learned icons failed',e)}loadIconLibrary();}
@@ -326,7 +397,7 @@ async function recognize(){
   if(!filled.length)throw new Error('没有识别到砖块，请确认上传的是完整游戏截图。');
   if(filled.length%2)throw new Error(`识别到 ${filled.length} 块砖（奇数），请重新截一张完整游戏图。`);
   const rcg=recognitionCandidates(ext.features,filled);
-  return {g,features:ext.features,filled:filled.length,known:filled.length-rcg.unknown.length,unknown:rcg.unknown.length,candidates:rcg.candidates,res:`${img.naturalWidth}×${img.naturalHeight}`,fullBoard:ext.fullBoard};
+  return {g,features:ext.features,filled:filled.length,known:filled.length-rcg.unknown.length,unknown:rcg.unknown.length,repaired:rcg.repaired||0,candidates:rcg.candidates,res:`${img.naturalWidth}×${img.naturalHeight}`,fullBoard:ext.fullBoard};
 }
 loadIconLibrary();
 function allowedOnLine(line){
@@ -547,11 +618,11 @@ solveBtn.addEventListener('click',async()=>{
   solveBtn.disabled=true;recognitionStatus.classList.remove('hide');recognitionStatus.textContent='正在识别固定图标并检查新图标……';
   try{
     const rec=await recognize();lastGeom=rec.g;
-    lastRecognitionSummary=`<span class="ok">✓ V12固定模板识别：</span>${rec.filled} 块砖，其中 ${rec.known} 块由已知模板直接认出，${rec.unknown} 块作为新/低置信图标进行配对；图标库共 ${iconLibrary.length} 种，截图 ${rec.res}`;
+    lastRecognitionSummary=`<span class="ok">✓ V13固定模板识别：</span>${rec.filled} 块砖，其中 ${rec.known} 块由已知模板直接认出，${rec.unknown} 块作为新/低置信图标进行配对；中心细节纠正 ${rec.repaired||0} 个混合类别；图标库共 ${iconLibrary.length} 种，截图 ${rec.res}`;
     recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>正在用多路线试探求完整解……`;
     await sleep(20);
     const solved=await solveRecognized(rec),sol=solved.result;
-    if(!sol.solved)throw new Error(`这次仍未找到完整解（最好剩 ${sol.bestRemain} 块）。V12已不再重分整盘图标；如果出现这个提示，请把这一整个结果框截给我，我只定位那几个未确定图标。`);
+    if(!sol.solved)throw new Error(`这次仍未找到完整解（最好剩 ${sol.bestRemain} 块）。V13已启用中心细节二次判别；如果出现这个提示，请把这一整个结果框截给我，我只定位那几个未确定图标。`);
     reps=solved.candidate.reps;initialBoard=solved.candidate.board;solutionMoves=sol.moves;solutionStates=sol.states;stepIndex=0;
     const learned=learnUnknownGroups(solved.candidate.unknownGroups,rec.features);
     recognitionStatus.innerHTML=`${lastRecognitionSummary}<br><span class="ok">✓ 已找到完整路线：</span>${solutionMoves.length} 步，使用“${sol.mode}”，共评估 ${solved.totalExpanded.toLocaleString()} 个候选局面，用时 ${(sol.ms/1000).toFixed(2)} 秒${learned?`；并新学会 ${learned} 种图标，下关会直接识别。`:''}`;
