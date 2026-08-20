@@ -27,7 +27,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
 <div class="wrap">
   <div class="hero">
     <h1>🧩 砖了个砖助手</h1>
-    <p>手机上传截图 → 自动定位 14×10 棋盘 → 从每块砖的前景形状识别相同图案 → 本地计算完整通关路线。针对后期关卡新增的 2 块组/相似颜色图标做了加强。</p>
+    <p>手机上传截图 → 自动定位 14×10 棋盘 → 从每块砖的前景形状识别相同图案 → 本地计算完整通关路线。针对后期关卡新增的 2 块组/相似颜色图标做了全局配对纠错。</p>
   </div>
 
   <div class="card" id="uploadCard">
@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v10 双阶段求解版 · 先用深度优先快速找通路，失败再扩大搜索 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v11 全局配对校正版 · 先做全局2-opt配对纠错，再用GBFS求完整路线 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -70,7 +70,7 @@ const fileInput=$('fileInput'),previewCard=$('previewCard'),previewCanvas=$('pre
 const recognitionStatus=$('recognitionStatus'),solveCard=$('solveCard'),boardCanvas=$('boardCanvas');
 const stepBadge=$('stepBadge'),instruction=$('instruction'),progressBar=$('progressBar'),prevBtn=$('prevBtn'),nextBtn=$('nextBtn');
 const xAdj=$('xAdj'),yAdj=$('yAdj'),sAdj=$('sAdj');
-let img=null,initialBoard=null,reps={},solutionMoves=[],solutionStates=[],stepIndex=0,lastGeom=null;
+let img=null,initialBoard=null,reps={},solutionMoves=[],solutionStates=[],stepIndex=0,lastGeom=null,lastRecognitionSummary='';
 
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function idx(r,c){return r*COLS+c}
@@ -152,7 +152,8 @@ function groupSelfLearned(features,filled){
     if(ai%8===0){recognitionStatus.textContent=`正在比较图标前景……${ai+1}/${filled.length}`}
   }
 
-  // Stage 1: every icon remaining on the board must have a mate. Form the globally closest pairs.
+  // v11 第一步：先做一个“全局最近”初始配对。
+  // 仅靠这一轮贪心，在后期大量相似图标出现时，偶尔会发生 A-B / C-D 被错配成 A-C / B-D。
   const unused=new Set(filled),pairs=[];
   while(unused.size){
     const list=[...unused];let ba=-1,bb=-1,bd=Infinity;
@@ -163,8 +164,31 @@ function groupSelfLearned(features,filled){
     pairs.push({a:ba,b:bb,d:bd});unused.delete(ba);unused.delete(bb);
   }
 
-  // Stage 2: some later levels contain icons that occur only twice. Merge two pairs into a 4-pack
-  // only when they are mutual-nearest AND clearly separated from the second-best pair.
+  // v11 第二步：2-opt 全局纠错。
+  // 任取两对 (a,b)(c,d)，若交换成 (a,c)(b,d) 或 (a,d)(b,c) 的总视觉差异更小，就交换。
+  // 不断做“全局收益最大”的交换，直到没有任何两对能继续变好。
+  // 这正是 V10 在“最好剩4块”场景中最容易缺失的一步。
+  let pairFixes=0;
+  for(let round=0;round<160;round++){
+    let bestGain=1e-8,best=null;
+    for(let i=0;i<pairs.length;i++){
+      const p=pairs[i];
+      for(let j=i+1;j<pairs.length;j++){
+        const q=pairs[j],cur=D[p.a][p.b]+D[q.a][q.b];
+        const alt1=D[p.a][q.a]+D[p.b][q.b];
+        const alt2=D[p.a][q.b]+D[p.b][q.a];
+        if(cur-alt1>bestGain){bestGain=cur-alt1;best={i,j,a:p.a,b:q.a,c:p.b,d:q.b}}
+        if(cur-alt2>bestGain){bestGain=cur-alt2;best={i,j,a:p.a,b:q.b,c:p.b,d:q.a}}
+      }
+    }
+    if(!best)break;
+    pairs[best.i]={a:best.a,b:best.b,d:D[best.a][best.b]};
+    pairs[best.j]={a:best.c,b:best.d,d:D[best.c][best.d]};
+    pairFixes++;
+  }
+
+  // 第三步：判断两“对子”是否其实属于同一个4块图案。
+  // 使用绝对视觉距离 + 相对间隔双重门槛。宁可暂时拆成两个2块组，也不把铃铛/稻草等不同图案强行合并。
   const P=pairs.length,PD=Array.from({length:P},()=>new Float32Array(P));
   for(let i=0;i<P;i++)for(let j=i+1;j<P;j++){
     const p=pairs[i],q=pairs[j];
@@ -175,21 +199,23 @@ function groupSelfLearned(features,filled){
     const a=[];for(let j=0;j<P;j++)if(j!==i)a.push([PD[i][j],j]);a.sort((x,y)=>x[0]-y[0]);return a;
   }
   const choices=Array.from({length:P},(_,i)=>pairChoices(i)),merged=new Set(),groups=[];
+  let ambiguousMerges=0;
   for(let i=0;i<P;i++){
     if(merged.has(i))continue;
-    const ci=choices[i];if(!ci.length){groups.push([pairs[i].a,pairs[i].b]);merged.add(i);continue}
+    const ci=choices[i];
+    if(!ci.length){groups.push([pairs[i].a,pairs[i].b]);merged.add(i);continue}
     const near=ci[0][0],j=ci[0][1],cj=choices[j],mutual=cj.length&&cj[0][1]===i;
     const ri=ci.length>1?near/Math.max(ci[1][0],1e-7):0;
     const rj=cj.length>1?near/Math.max(cj[1][0],1e-7):0;
-    const base=Math.max(pairs[i].d,pairs[j].d,1e-5);
-    const onlyTwoPairs=(P===2);
+    // 在多张真实关卡截图上，同图案两对子之间通常 <0.0215；
+    // 如果稍高，则必须同时满足非常明显的“最近邻间隔”。
     const confident=mutual && !merged.has(j) && (
-      (ci.length>1&&cj.length>1&&ri<0.64&&rj<0.64) ||
-      (onlyTwoPairs&&near<0.035&&near<base*5.0)
+      near<0.0215 || (near<0.0280&&ri<0.45&&rj<0.45)
     );
     if(confident){
       groups.push([pairs[i].a,pairs[i].b,pairs[j].a,pairs[j].b]);merged.add(i);merged.add(j);
     }else{
+      if(mutual&&near<0.032)ambiguousMerges++;
       groups.push([pairs[i].a,pairs[i].b]);merged.add(i);
     }
   }
@@ -197,7 +223,7 @@ function groupSelfLearned(features,filled){
   let meanPair=0,maxPair=0,weak=0;
   for(const p of pairs){meanPair+=p.d;maxPair=Math.max(maxPair,p.d);if(p.d>0.060)weak++}
   meanPair/=Math.max(1,pairs.length);
-  return {groups,D,pairs,meanPair,maxPair,weak};
+  return {groups,D,pairs,PD,meanPair,maxPair,weak,pairFixes,ambiguousMerges};
 }
 async function extractSelfFeatures(g){
   const tiny=document.createElement('canvas');tiny.width=FP;tiny.height=FP;
@@ -254,7 +280,7 @@ async function recognize(){
   if(learned.weak>0)throw new Error(`有 ${learned.weak} 对图案相似度过低，识别结果不可靠。请使用游戏原始截图，不要经过微信压缩。`);
   const board=Array(N).fill(0);reps={};let gid=1,n2=0,n4=0;
   for(const group of groups){for(const i of group)board[i]=gid;reps[gid]=group[0];if(group.length===2)n2++;else n4++;gid++}
-  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g,n2,n4,weak:learned.weak,mean:learned.meanPair,maxPair:learned.maxPair,res:`${img.naturalWidth}×${img.naturalHeight}`,threshold:ext.threshold,fullBoard:ext.fullBoard};
+  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g,n2,n4,weak:learned.weak,mean:learned.meanPair,maxPair:learned.maxPair,pairFixes:learned.pairFixes,ambiguousMerges:learned.ambiguousMerges,res:`${img.naturalWidth}×${img.naturalHeight}`,threshold:ext.threshold,fullBoard:ext.fullBoard};
 }
 function allowedOnLine(line){
   const n=line.length,left=Array(n).fill(0),right=Array(n).fill(0);
@@ -353,52 +379,19 @@ class MinHeap{
   }
 }
 async function solveBoard(start){
-  const totalStart=performance.now();
-
-  // v10 第一阶段：贪心深度优先。
-  // 每一步都会固定消掉2块，因此先沿“下一步选择最多”的路线一路走到底，
-  // 对后期满盘通常比把几十万个浅层局面全塞进优先队列快几个数量级。
-  let dfsNodes=0,dfsBest=countTiles(start),dfsStop=false;
-  const dead=new Set(),pathMoves=[],pathStates=[start];
-  const dfsStart=performance.now();
-
-  function dfsFast(b){
-    dfsNodes++;
-    const remain=countTiles(b);if(remain<dfsBest)dfsBest=remain;
-    if(remain===0)return true;
-    if(dfsNodes>30000||performance.now()-dfsStart>8000){dfsStop=true;return false;}
-    const k=stateKey(b);if(dead.has(k))return false;
-    const cs=candidates(b);
-    if(!cs.length){dead.add(k);return false;}
-    for(const ch of cs){
-      pathMoves.push(ch.move);pathStates.push(ch.board);
-      if(dfsFast(ch.board))return true;
-      pathMoves.pop();pathStates.pop();
-      if(dfsStop)return false;
-    }
-    dead.add(k);return false;
-  }
-
-  recognitionStatus.innerHTML='正在快速寻找通关路线……';
-  await sleep(0);
-  if(dfsFast(start)){
-    return {moves:pathMoves.slice(),states:pathStates.slice(),expanded:dfsNodes,ms:performance.now()-totalStart,mode:'DFS'};
-  }
-
-  // 第二阶段：如果快速深搜没直接命中，再用原来的最佳优先搜索扩大范围。
-  recognitionStatus.innerHTML=`快速搜索检查了 ${dfsNodes.toLocaleString()} 个局面（最好剩 ${dfsBest} 块），正在扩大搜索范围……`;
-  await sleep(0);
-  const visited=new Set(),parents=new Map();
+  // v11 回到公开求解器验证过的 GBFS 思路：
+  // 优先“剩余砖更少”的状态，其次“下一步可走法更多”的状态。
+  // V10 的 DFS 预热在配对存在一点歧义时会浪费时间；经过2-opt纠错后，正确棋盘通常很快收敛。
+  const t0=performance.now(),visited=new Set(),parents=new Map();
   let seq=0,expanded=0,bestRemain=countTiles(start);
   const rootKey=stateKey(start);
   parents.set(rootKey,{parent:null,move:null,board:start});
   const heap=new MinHeap((a,b)=>a.remain-b.remain||a.avail-b.avail||a.seq-b.seq);
   heap.push({board:start,key:rootKey,remain:countTiles(start),avail:-availableMoves(start).length,seq:seq++});
-  const fallbackStart=performance.now();
   while(heap.length){
     const cur=heap.pop(),b=cur.board,k=cur.key;
     if(visited.has(k))continue;
-    if(countTiles(b)===0){
+    if(cur.remain===0){
       const moves=[],states=[];let ck=k;
       while(ck!==null){
         const info=parents.get(ck);states.push(info.board);
@@ -406,7 +399,7 @@ async function solveBoard(start){
         ck=info.parent;
       }
       moves.reverse();states.reverse();
-      return {moves,states,expanded:dfsNodes+expanded,ms:performance.now()-totalStart,mode:'GBFS'};
+      return {moves,states,expanded,ms:performance.now()-t0,mode:'GBFS'};
     }
     visited.add(k);expanded++;if(cur.remain<bestRemain)bestRemain=cur.remain;
     const localSeen=new Set();
@@ -415,19 +408,21 @@ async function solveBoard(start){
       const nk=stateKey(nb);
       if(localSeen.has(nk)||visited.has(nk)||parents.has(nk))continue;
       localSeen.add(nk);
-      const fm=availableMoves(nb),av=fm.length;
+      const av=availableMoves(nb).length,remain=countTiles(nb);
       parents.set(nk,{parent:k,move:m,board:nb});
-      heap.push({board:nb,key:nk,remain:countTiles(nb),avail:-av,seq:seq++});
+      heap.push({board:nb,key:nk,remain,avail:-av,seq:seq++});
     }
     if(expanded%25===0){
-      recognitionStatus.innerHTML=`扩大搜索中……共检查 ${(dfsNodes+expanded).toLocaleString()} 个局面，当前最好剩 ${Math.min(dfsBest,bestRemain)} 块`;
+      recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>正在计算路线……已检查 ${expanded.toLocaleString()} 个局面，当前最好剩 ${bestRemain} 块`;
       await sleep(0);
     }
-    if(expanded>180000||performance.now()-fallbackStart>52000){
-      throw new Error(`求解仍未完成（共检查 ${(dfsNodes+expanded).toLocaleString()} 个局面，最好剩 ${Math.min(dfsBest,bestRemain)} 块）。如果最好只剩2~4块，说明已经非常接近成功，可能是搜索分支过深，也可能是少数图案被分错组；把这一行结果截给我即可继续定位。`);
+    const elapsed=performance.now()-t0;
+    // 正确识别的常见盘面往往几百到几千状态就能解；这里仍给后期关卡较大的余量。
+    if(expanded>260000||elapsed>65000){
+      throw new Error(`求解未完成（已检查 ${expanded.toLocaleString()} 个局面，最好剩 ${bestRemain} 块）。如果仍只剩2~4块，通常是极少数相似图标配对仍有歧义；V11已做全局配对纠错，请把“识别成功”那行和这行一起截图给我。`);
     }
   }
-  throw new Error('当前识别结果没有找到通关路线。可能有少数图案被错误配对。');
+  throw new Error(`当前识别结果无完整解（最好剩 ${bestRemain} 块）。这通常表示有少数图案仍被错误分组。`);
 }
 function sourceCellRect(i){
   const g=lastGeom,[r,c]=rc(i);
@@ -513,15 +508,15 @@ solveBtn.addEventListener('click',async()=>{
       const sizes=rec.bad.map(x=>x.length).join('、');
       throw new Error(`图案分组不完整（异常组大小：${sizes}）。请重新截一张完整游戏图后重试。`);
     }
-    recognitionStatus.innerHTML=`<span class="ok">✓ 前景识别成功：</span>${rec.filled} 块砖，${rec.groups} 种图案（4块×${rec.n4}，2块×${rec.n2}），平均配对差异 ${rec.mean.toFixed(4)}，截图 ${rec.res}。正在搜索完整路线……`;
+    lastRecognitionSummary=`<span class="ok">✓ V11识别成功：</span>${rec.filled} 块砖，${rec.groups} 种图案（4块×${rec.n4}，2块×${rec.n2}），全局纠正配对 ${rec.pairFixes} 次${rec.ambiguousMerges?`，保留 ${rec.ambiguousMerges} 个低置信4块候选为2块组`:``}，平均配对差异 ${rec.mean.toFixed(4)}，截图 ${rec.res}`; recognitionStatus.innerHTML=`${lastRecognitionSummary}<br>正在搜索完整路线……`;
     await sleep(20);
     const sol=await solveBoard(initialBoard);
     solutionMoves=sol.moves;solutionStates=sol.states;stepIndex=0;
-    recognitionStatus.innerHTML=`<span class="ok">✓ 已找到完整路线：</span>${solutionMoves.length} 步，检查 ${sol.expanded.toLocaleString()} 个局面，用时 ${(sol.ms/1000).toFixed(2)} 秒。`;
+    recognitionStatus.innerHTML=`${lastRecognitionSummary}<br><span class="ok">✓ 已找到完整路线：</span>${solutionMoves.length} 步，检查 ${sol.expanded.toLocaleString()} 个局面，用时 ${(sol.ms/1000).toFixed(2)} 秒。`;
     solveCard.classList.remove('hide');renderStep();
     setTimeout(()=>solveCard.scrollIntoView({behavior:'smooth',block:'start'}),80);
   }catch(e){
-    recognitionStatus.innerHTML=`<span class="bad">✕ ${e.message}</span>`;
+    recognitionStatus.innerHTML=`${lastRecognitionSummary?lastRecognitionSummary+"<br>":""}<span class="bad">✕ ${e.message}</span>`;
   }finally{
     solveBtn.disabled=false;
   }
