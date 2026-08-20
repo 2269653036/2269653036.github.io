@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v7 精确配对修正版 · 防止铃铛/稻草等相似颜色误分组 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v8 空格识别修正版 · 自动区分棕色空格与亮色砖块 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -194,10 +194,16 @@ function groupSelfLearned(features,filled){
   for(const p of pairs){meanIn+=p.d;edges++;maxPair=Math.max(maxPair,p.d);if(p.d>0.022)weak++}
   return {groups,D,weak,meanIn:edges?meanIn/edges:0,maxPair};
 }
+function meanLuma(f){
+  let sum=0,n=0;
+  for(let i=0;i<f.length;i+=3){sum+=0.2126*f[i]+0.7152*f[i+1]+0.0722*f[i+2];n++}
+  return sum/(n*255);
+}
 async function extractSelfFeatures(g){
   const tiny=document.createElement('canvas');tiny.width=FP;tiny.height=FP;
-  const tc=tiny.getContext('2d',{willReadFrequently:true}),features=Array(N),filled=[];
-  const mx=g.cw*0.08,my=g.ch*0.08,sw=g.cw-2*mx,sh=g.ch-2*my;
+  const tc=tiny.getContext('2d',{willReadFrequently:true}),features=Array(N),lumas=Array(N).fill(0);
+  // Crop farther inside the cell so the grid border itself cannot be mistaken for a tile.
+  const mx=g.cw*0.12,my=g.ch*0.12,sw=g.cw-2*mx,sh=g.ch-2*my;
   if(![g.x,g.y,g.cw,g.ch,mx,my,sw,sh].every(Number.isFinite)||sw<=2||sh<=2)throw new Error('棋盘坐标计算异常，请重新选择截图。');
   for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
     const i=idx(r,c),sx=g.x+c*g.cw+mx,sy=g.y+r*g.ch+my;
@@ -205,23 +211,53 @@ async function extractSelfFeatures(g){
     tc.clearRect(0,0,FP,FP);tc.drawImage(img,sx,sy,sw,sh,0,0,FP,FP);
     const d=tc.getImageData(0,0,FP,FP).data,f=new Uint8Array(FP*FP*3);let q=0;
     for(let p=0;p<d.length;p+=4){f[q++]=d[p];f[q++]=d[p+1];f[q++]=d[p+2]}
-    features[i]=f;if(featureStd(f)>0.020)filled.push(i);
+    features[i]=f;lumas[i]=meanLuma(f);
   }
-  return {features,filled};
+
+  // Empty cells are the dark brown board; occupied cells have a much brighter cream/green tile base.
+  // Learn the split from this screenshot instead of using icon variance. This prevents simple/flat icons
+  // from being accidentally counted as empty (the V7 '99 tiles' problem).
+  const sorted=lumas.map((v,i)=>[v,i]).sort((a,b)=>a[0]-b[0]);
+  let bestGap=0,threshold=0.47;
+  for(let k=0;k<sorted.length-1;k++){
+    const a=sorted[k][0],b=sorted[k+1][0],mid=(a+b)/2,gap=b-a;
+    if(mid>0.34&&mid<0.64&&gap>bestGap){bestGap=gap;threshold=mid}
+  }
+  if(bestGap<0.055){
+    // A fresh full board has no brown empty cluster. If even the darkest cell is bright, all 140 are occupied.
+    if(sorted[0][0]>0.47) threshold=sorted[0][0]-0.01;
+    else threshold=0.47;
+  }
+  let filled=[];
+  for(let i=0;i<N;i++)if(lumas[i]>threshold)filled.push(i);
+
+  // Pair eliminations guarantee an even number of remaining bricks. If JPEG scaling puts exactly one cell
+  // on the boundary, flip only the closest-to-threshold cell and let the later visual-pair confidence check
+  // decide whether the resulting board is trustworthy.
+  let parityAdjusted=false;
+  if(filled.length%2!==0){
+    let bi=-1,bd=Infinity;
+    for(let i=0;i<N;i++){const d=Math.abs(lumas[i]-threshold);if(d<bd){bd=d;bi=i}}
+    if(bi>=0&&bd<0.045){
+      const pos=filled.indexOf(bi);if(pos>=0)filled.splice(pos,1);else filled.push(bi);
+      parityAdjusted=true;
+    }
+  }
+  return {features,filled,lumas,threshold,bestGap,parityAdjusted};
 }
 async function recognize(){
   const g=geometry();lastGeom=g;drawPreview();
   recognitionStatus.textContent='正在精确配对本关图案（先配成对，再判断是否为4块同图案）……';await sleep(10);
-  const {features,filled}=await extractSelfFeatures(g);
+  const {features,filled,threshold,bestGap,parityAdjusted}=await extractSelfFeatures(g);
   if(!filled.length)throw new Error('没有识别到砖块，请确认上传的是完整游戏截图。');
-  if(filled.length%2!==0)throw new Error(`识别到 ${filled.length} 块砖（奇数），说明棋盘定位异常。`);
-  recognitionStatus.textContent=`已定位 ${filled.length} 块砖，正在比较相同图案……`;await sleep(10);
+  if(filled.length%2!==0)throw new Error(`识别到 ${filled.length} 块砖（奇数）。自动空格识别仍有歧义，请重新截一张完整游戏图。`);
+  recognitionStatus.textContent=`已定位 ${filled.length} 块砖（空格 ${N-filled.length} 个，亮度阈值 ${threshold.toFixed(3)}${parityAdjusted?'，已自动修正1个临界格':''}），正在比较相同图案……`;await sleep(10);
   const learned=groupSelfLearned(features,filled),groups=learned.groups;
   const bad=groups.filter(x=>x.length!==2&&x.length!==4);
   if(bad.length)throw new Error('图案自动分组未通过校验，请重新截一张完整游戏图。');
   const board=Array(N).fill(0);reps={};let gid=1,n2=0,n4=0;
   for(const group of groups){for(const i of group)board[i]=gid;reps[gid]=group[0];if(group.length===2)n2++;else if(group.length===4)n4++;gid++}
-  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g,n2,n4,weak:learned.weak,mean:learned.meanIn,res:`${img.naturalWidth}×${img.naturalHeight}`};
+  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g,n2,n4,weak:learned.weak,mean:learned.meanIn,res:`${img.naturalWidth}×${img.naturalHeight}`,threshold,bestGap,parityAdjusted};
 }
 function allowedOnLine(line){
   const n=line.length,left=Array(n).fill(0),right=Array(n).fill(0);
