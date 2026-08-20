@@ -27,7 +27,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
 <div class="wrap">
   <div class="hero">
     <h1>🧩 砖了个砖助手</h1>
-    <p>手机上传一张游戏截图 → 自动定位 14×10 棋盘 → 每一盘现场学习相同图案 → 本地计算完整通关路线。支持 iPhone 15 Pro Max，也不依赖固定图标模板。</p>
+    <p>手机上传截图 → 自动定位 14×10 棋盘 → 从每块砖的前景形状识别相同图案 → 本地计算完整通关路线。针对后期关卡新增的 2 块组/相似颜色图标做了加强。</p>
   </div>
 
   <div class="card" id="uploadCard">
@@ -60,7 +60,7 @@ details{margin-top:12px;border-top:1px solid #edf1ef;padding-top:10px}summary{fo
     <button class="secondary" id="restartBtn">换一张截图重新计算</button>
   </div>
 
-  <div class="foot">v8 空格识别修正版 · 自动区分棕色空格与亮色砖块 · 所有识别和求解都在浏览器本地完成</div>
+  <div class="foot">v9 前景特征识别版 · 用砖块四角判断空格，用图标前景形状配对 · 所有识别和求解都在浏览器本地完成</div>
 </div>
 <script>
 'use strict';
@@ -118,32 +118,30 @@ fileInput.addEventListener('change',()=>{
   im.src=url;
 });
 
-const FP=10;
-function featureStd(f){
-  let sr=0,sg=0,sb=0,sr2=0,sg2=0,sb2=0,n=FP*FP;
-  for(let i=0;i<f.length;i+=3){const R=f[i]/255,G=f[i+1]/255,B=f[i+2]/255;sr+=R;sg+=G;sb+=B;sr2+=R*R;sg2+=G*G;sb2+=B*B}
-  const vr=Math.max(0,sr2/n-(sr/n)**2),vg=Math.max(0,sg2/n-(sg/n)**2),vb=Math.max(0,sb2/n-(sb/n)**2);
-  return (Math.sqrt(vr)+Math.sqrt(vg)+Math.sqrt(vb))/3;
+const FP=16,FC=4;
+function medianNumber(a){
+  const b=a.slice().sort((x,y)=>x-y),n=b.length,m=n>>1;
+  return n%2?b[m]:(b[m-1]+b[m])/2;
 }
 function shiftDistance(a,b){
-  // Same sprite can land on a slightly different sub-pixel phase after screenshot/browser scaling.
-  // Compare all 1-pixel translations and keep the best match instead of demanding pixel-perfect alignment.
+  // v9: compare foreground-normalized icon shape/color, not the pale tile background.
+  // One-pixel translation compensation handles Safari/iPhone screenshot resampling.
   let best=Infinity;
   for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
-    const ya0=Math.max(0,dy),ya1=Math.min(FP,FP+dy),xa0=Math.max(0,dx),xa1=Math.min(FP,FP+dx);
+    const y0=Math.max(0,dy),y1=Math.min(FP,FP+dy),x0=Math.max(0,dx),x1=Math.min(FP,FP+dx);
     let sum=0,n=0;
-    for(let y=ya0;y<ya1;y++)for(let x=xa0;x<xa1;x++){
-      const ia=(y*FP+x)*3,ib=((y-dy)*FP+(x-dx))*3;
-      let d=a[ia]-b[ib];sum+=d*d;d=a[ia+1]-b[ib+1];sum+=d*d;d=a[ia+2]-b[ib+2];sum+=d*d;n+=3;
+    for(let yy=y0;yy<y1;yy++)for(let xx=x0;xx<x1;xx++){
+      const ia=(yy*FP+xx)*FC,ib=((yy-dy)*FP+(xx-dx))*FC;
+      let d=a[ia]-b[ib];sum+=0.70*d*d;
+      d=a[ia+1]-b[ib+1];sum+=0.10*d*d;
+      d=a[ia+2]-b[ib+2];sum+=0.10*d*d;
+      d=a[ia+3]-b[ib+3];sum+=0.10*d*d;
+      n++;
     }
-    const v=sum/(n*255*255);if(v<best)best=v;
+    const v=sum/Math.max(1,n);if(v<best)best=v;
   }
   return best;
 }
-function nearestList(i,pool,D,k){
-  const out=[];for(const j of pool)if(j!==i)out.push([D[i][j],j]);out.sort((a,b)=>a[0]-b[0]);return out.slice(0,k);
-}
-function sameSet(a,b){if(a.size!==b.size)return false;for(const x of a)if(!b.has(x))return false;return true}
 function groupSelfLearned(features,filled){
   const D=Array.from({length:N},()=>new Float32Array(N));
   for(let ai=0;ai<filled.length;ai++){
@@ -151,113 +149,112 @@ function groupSelfLearned(features,filled){
     for(let bj=ai+1;bj<filled.length;bj++){
       const j=filled[bj],d=shiftDistance(features[i],features[j]);D[i][j]=D[j][i]=d;
     }
+    if(ai%8===0){recognitionStatus.textContent=`正在比较图标前景……${ai+1}/${filled.length}`}
   }
 
-  // v7: first form the most visually similar PAIRS, then merge two pairs into a four-pack
-  // only when all four images are genuinely near-identical. This avoids confusing two yellow
-  // icons such as the bell and the straw bundle when a partial board leaves only two of each.
+  // Stage 1: every icon remaining on the board must have a mate. Form the globally closest pairs.
   const unused=new Set(filled),pairs=[];
   while(unused.size){
     const list=[...unused];let ba=-1,bb=-1,bd=Infinity;
     for(let x=0;x<list.length;x++)for(let y=x+1;y<list.length;y++){
       const a=list[x],b=list[y],d=D[a][b];if(d<bd){bd=d;ba=a;bb=b}
     }
-    if(ba<0)throw new Error('自动配对失败，请重新截图后再试。');
+    if(ba<0)throw new Error('自动配对失败，请重新截一张游戏图。');
     pairs.push({a:ba,b:bb,d:bd});unused.delete(ba);unused.delete(bb);
   }
 
-  const pairUnused=new Set(pairs.map((_,i)=>i)),groups=[];
-  while(pairUnused.size){
-    const i=[...pairUnused][0],p=pairs[i];let bestJ=-1,bestAvg=Infinity;
-    for(const j of pairUnused){
-      if(j===i)continue;const q=pairs[j];
-      const cross=[D[p.a][q.a],D[p.a][q.b],D[p.b][q.a],D[p.b][q.b]];
-      const avg=(cross[0]+cross[1]+cross[2]+cross[3])/4,maxCross=Math.max(...cross);
-      const base=Math.max(p.d,q.d,0.001);
-      // Same sprite repeated four times stays extremely close after 1-pixel shift compensation.
-      // Different but similarly colored icons are typically > 0.02. Require both an absolute
-      // shape match and a relative match to the two internal pair distances.
-      const fourMatch=maxCross<0.0165 && avg<Math.max(0.0125,base*2.15);
-      if(fourMatch && avg<bestAvg){bestAvg=avg;bestJ=j}
-    }
-    if(bestJ>=0){
-      const q=pairs[bestJ];groups.push([p.a,p.b,q.a,q.b]);pairUnused.delete(i);pairUnused.delete(bestJ);
+  // Stage 2: some later levels contain icons that occur only twice. Merge two pairs into a 4-pack
+  // only when they are mutual-nearest AND clearly separated from the second-best pair.
+  const P=pairs.length,PD=Array.from({length:P},()=>new Float32Array(P));
+  for(let i=0;i<P;i++)for(let j=i+1;j<P;j++){
+    const p=pairs[i],q=pairs[j];
+    const avg=(D[p.a][q.a]+D[p.a][q.b]+D[p.b][q.a]+D[p.b][q.b])/4;
+    PD[i][j]=PD[j][i]=avg;
+  }
+  function pairChoices(i){
+    const a=[];for(let j=0;j<P;j++)if(j!==i)a.push([PD[i][j],j]);a.sort((x,y)=>x[0]-y[0]);return a;
+  }
+  const choices=Array.from({length:P},(_,i)=>pairChoices(i)),merged=new Set(),groups=[];
+  for(let i=0;i<P;i++){
+    if(merged.has(i))continue;
+    const ci=choices[i];if(!ci.length){groups.push([pairs[i].a,pairs[i].b]);merged.add(i);continue}
+    const near=ci[0][0],j=ci[0][1],cj=choices[j],mutual=cj.length&&cj[0][1]===i;
+    const ri=ci.length>1?near/Math.max(ci[1][0],1e-7):0;
+    const rj=cj.length>1?near/Math.max(cj[1][0],1e-7):0;
+    const base=Math.max(pairs[i].d,pairs[j].d,1e-5);
+    const onlyTwoPairs=(P===2);
+    const confident=mutual && !merged.has(j) && (
+      (ci.length>1&&cj.length>1&&ri<0.64&&rj<0.64) ||
+      (onlyTwoPairs&&near<0.035&&near<base*5.0)
+    );
+    if(confident){
+      groups.push([pairs[i].a,pairs[i].b,pairs[j].a,pairs[j].b]);merged.add(i);merged.add(j);
     }else{
-      groups.push([p.a,p.b]);pairUnused.delete(i);
+      groups.push([pairs[i].a,pairs[i].b]);merged.add(i);
     }
   }
 
-  // Confidence check. Pairing distances can rise slightly after browser scaling, but a very large
-  // pair distance usually means two different icons were forced together. We warn rather than
-  // silently giving the user a visually wrong route.
-  let weak=0,meanIn=0,edges=0,maxPair=0;
-  for(const p of pairs){meanIn+=p.d;edges++;maxPair=Math.max(maxPair,p.d);if(p.d>0.022)weak++}
-  return {groups,D,weak,meanIn:edges?meanIn/edges:0,maxPair};
-}
-function meanLuma(f){
-  let sum=0,n=0;
-  for(let i=0;i<f.length;i+=3){sum+=0.2126*f[i]+0.7152*f[i+1]+0.0722*f[i+2];n++}
-  return sum/(n*255);
+  let meanPair=0,maxPair=0,weak=0;
+  for(const p of pairs){meanPair+=p.d;maxPair=Math.max(maxPair,p.d);if(p.d>0.060)weak++}
+  meanPair/=Math.max(1,pairs.length);
+  return {groups,D,pairs,meanPair,maxPair,weak};
 }
 async function extractSelfFeatures(g){
   const tiny=document.createElement('canvas');tiny.width=FP;tiny.height=FP;
-  const tc=tiny.getContext('2d',{willReadFrequently:true}),features=Array(N),lumas=Array(N).fill(0);
-  // Crop farther inside the cell so the grid border itself cannot be mistaken for a tile.
-  const mx=g.cw*0.12,my=g.ch*0.12,sw=g.cw-2*mx,sh=g.ch-2*my;
+  const tc=tiny.getContext('2d',{willReadFrequently:true}),features=Array(N),cornerLuma=Array(N).fill(0);
+  const mx=g.cw*0.06,my=g.ch*0.06,sw=g.cw-2*mx,sh=g.ch-2*my;
   if(![g.x,g.y,g.cw,g.ch,mx,my,sw,sh].every(Number.isFinite)||sw<=2||sh<=2)throw new Error('棋盘坐标计算异常，请重新选择截图。');
+  const K=3;
   for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){
     const i=idx(r,c),sx=g.x+c*g.cw+mx,sy=g.y+r*g.ch+my;
     if(sx<0||sy<0||sx+sw>img.naturalWidth||sy+sh>img.naturalHeight)throw new Error('棋盘超出截图范围，请确认上传的是完整游戏截图。');
     tc.clearRect(0,0,FP,FP);tc.drawImage(img,sx,sy,sw,sh,0,0,FP,FP);
-    const d=tc.getImageData(0,0,FP,FP).data,f=new Uint8Array(FP*FP*3);let q=0;
-    for(let p=0;p<d.length;p+=4){f[q++]=d[p];f[q++]=d[p+1];f[q++]=d[p+2]}
-    features[i]=f;lumas[i]=meanLuma(f);
-  }
-
-  // Empty cells are the dark brown board; occupied cells have a much brighter cream/green tile base.
-  // Learn the split from this screenshot instead of using icon variance. This prevents simple/flat icons
-  // from being accidentally counted as empty (the V7 '99 tiles' problem).
-  const sorted=lumas.map((v,i)=>[v,i]).sort((a,b)=>a[0]-b[0]);
-  let bestGap=0,threshold=0.47;
-  for(let k=0;k<sorted.length-1;k++){
-    const a=sorted[k][0],b=sorted[k+1][0],mid=(a+b)/2,gap=b-a;
-    if(mid>0.34&&mid<0.64&&gap>bestGap){bestGap=gap;threshold=mid}
-  }
-  if(bestGap<0.055){
-    // A fresh full board has no brown empty cluster. If even the darkest cell is bright, all 140 are occupied.
-    if(sorted[0][0]>0.47) threshold=sorted[0][0]-0.01;
-    else threshold=0.47;
-  }
-  let filled=[];
-  for(let i=0;i<N;i++)if(lumas[i]>threshold)filled.push(i);
-
-  // Pair eliminations guarantee an even number of remaining bricks. If JPEG scaling puts exactly one cell
-  // on the boundary, flip only the closest-to-threshold cell and let the later visual-pair confidence check
-  // decide whether the resulting board is trustworthy.
-  let parityAdjusted=false;
-  if(filled.length%2!==0){
-    let bi=-1,bd=Infinity;
-    for(let i=0;i<N;i++){const d=Math.abs(lumas[i]-threshold);if(d<bd){bd=d;bi=i}}
-    if(bi>=0&&bd<0.045){
-      const pos=filled.indexOf(bi);if(pos>=0)filled.splice(pos,1);else filled.push(bi);
-      parityAdjusted=true;
+    const d=tc.getImageData(0,0,FP,FP).data,rs=[],gs=[],bs=[];
+    for(let yy=0;yy<FP;yy++)for(let xx=0;xx<FP;xx++){
+      if(!((yy<K||yy>=FP-K)&&(xx<K||xx>=FP-K)))continue;
+      const p=(yy*FP+xx)*4;rs.push(d[p]/255);gs.push(d[p+1]/255);bs.push(d[p+2]/255);
     }
+    const br=medianNumber(rs),bg=medianNumber(gs),bb=medianNumber(bs);
+    cornerLuma[i]=0.2126*br+0.7152*bg+0.0722*bb;
+    const f=new Float32Array(FP*FP*FC);let q=0;
+    for(let p=0;p<d.length;p+=4){
+      const R=d[p]/255,G=d[p+1]/255,B=d[p+2]/255,dr=R-br,dg=G-bg,db=B-bb;
+      const mag=Math.sqrt(dr*dr+dg*dg+db*db),mask=Math.max(0,Math.min(1,(mag-0.035)/0.25));
+      f[q++]=mask;f[q++]=dr*mask;f[q++]=dg*mask;f[q++]=db*mask;
+    }
+    features[i]=f;
   }
-  return {features,filled,lumas,threshold,bestGap,parityAdjusted};
+
+  // Occupancy is decided from the four CORNERS of each cell. Icons are centered, so dark/flat icons
+  // can no longer be mistaken for brown empty board cells (the v8 failure mode on later levels).
+  const minL=Math.min(...cornerLuma),maxL=Math.max(...cornerLuma),sorted=[...cornerLuma].sort((a,b)=>a-b);
+  let threshold=0.72,fullBoard=false,bestGap=0;
+  if(minL>0.72){
+    fullBoard=true;threshold=minL-0.02;
+  }else{
+    for(let k=0;k<sorted.length-1;k++){
+      const a=sorted[k],b=sorted[k+1],mid=(a+b)/2,gap=b-a;
+      if(mid>0.50&&mid<0.86&&gap>bestGap){bestGap=gap;threshold=mid}
+    }
+    if(bestGap<0.07)threshold=0.72;
+  }
+  const filled=[];for(let i=0;i<N;i++)if(cornerLuma[i]>threshold)filled.push(i);
+  return {features,filled,cornerLuma,threshold,bestGap,fullBoard,minL,maxL};
 }
 async function recognize(){
   const g=geometry();lastGeom=g;drawPreview();
-  recognitionStatus.textContent='正在精确配对本关图案（先配成对，再判断是否为4块同图案）……';await sleep(10);
-  const {features,filled,threshold,bestGap,parityAdjusted}=await extractSelfFeatures(g);
+  recognitionStatus.textContent='正在用每格四角判断空格/砖块……';await sleep(10);
+  const ext=await extractSelfFeatures(g),filled=ext.filled;
   if(!filled.length)throw new Error('没有识别到砖块，请确认上传的是完整游戏截图。');
-  if(filled.length%2!==0)throw new Error(`识别到 ${filled.length} 块砖（奇数）。自动空格识别仍有歧义，请重新截一张完整游戏图。`);
-  recognitionStatus.textContent=`已定位 ${filled.length} 块砖（空格 ${N-filled.length} 个，亮度阈值 ${threshold.toFixed(3)}${parityAdjusted?'，已自动修正1个临界格':''}），正在比较相同图案……`;await sleep(10);
-  const learned=groupSelfLearned(features,filled),groups=learned.groups;
+  if(filled.length%2!==0)throw new Error(`识别到 ${filled.length} 块砖（奇数）。请重新截图；本版不会再自动猜一个格子来凑偶数。`);
+  recognitionStatus.textContent=`已定位 ${filled.length} 块砖（空格 ${N-filled.length} 个${ext.fullBoard?'，检测为满盘':''}），正在按图标前景形状配对……`;await sleep(10);
+  const learned=groupSelfLearned(ext.features,filled),groups=learned.groups;
   const bad=groups.filter(x=>x.length!==2&&x.length!==4);
-  if(bad.length)throw new Error('图案自动分组未通过校验，请重新截一张完整游戏图。');
+  if(bad.length)throw new Error('图案自动分组未通过校验。');
+  if(learned.weak>0)throw new Error(`有 ${learned.weak} 对图案相似度过低，识别结果不可靠。请使用游戏原始截图，不要经过微信压缩。`);
   const board=Array(N).fill(0);reps={};let gid=1,n2=0,n4=0;
-  for(const group of groups){for(const i of group)board[i]=gid;reps[gid]=group[0];if(group.length===2)n2++;else if(group.length===4)n4++;gid++}
-  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g,n2,n4,weak:learned.weak,mean:learned.meanIn,res:`${img.naturalWidth}×${img.naturalHeight}`,threshold,bestGap,parityAdjusted};
+  for(const group of groups){for(const i of group)board[i]=gid;reps[gid]=group[0];if(group.length===2)n2++;else n4++;gid++}
+  return {board,filled:filled.length,groups:groups.length,bad:[],even:true,g,n2,n4,weak:learned.weak,mean:learned.meanPair,maxPair:learned.maxPair,res:`${img.naturalWidth}×${img.naturalHeight}`,threshold:ext.threshold,fullBoard:ext.fullBoard};
 }
 function allowedOnLine(line){
   const n=line.length,left=Array(n).fill(0),right=Array(n).fill(0);
@@ -352,7 +349,7 @@ class MinHeap{
 }
 async function solveBoard(start){
   const t0=performance.now(),visited=new Set(),parents=new Map();
-  let seq=0,expanded=0;
+  let seq=0,expanded=0,bestRemain=countTiles(start);
   const rootKey=stateKey(start);
   parents.set(rootKey,{parent:null,move:null,board:start});
   const heap=new MinHeap((a,b)=>a.remain-b.remain||a.avail-b.avail||a.seq-b.seq);
@@ -370,7 +367,7 @@ async function solveBoard(start){
       moves.reverse();states.reverse();
       return {moves,states,expanded,ms:performance.now()-t0};
     }
-    visited.add(k);expanded++;
+    visited.add(k);expanded++;if(cur.remain<bestRemain)bestRemain=cur.remain;
     const localSeen=new Set();
     for(const m of availableMoves(b)){
       const nb=applyMove(b,m);if(!nb)continue;
@@ -382,10 +379,10 @@ async function solveBoard(start){
       heap.push({board:nb,key:nk,remain:countTiles(nb),avail:-av,seq:seq++});
     }
     if(expanded%20===0){
-      recognitionStatus.innerHTML=`正在计算路线……已检查 ${expanded.toLocaleString()} 个局面`;
+      recognitionStatus.innerHTML=`正在计算路线……已检查 ${expanded.toLocaleString()} 个局面，当前最好剩 ${bestRemain} 块`;
       await sleep(0);
     }
-    if(expanded>250000||performance.now()-t0>60000)throw new Error('搜索时间过长。请重新上传刚进入关卡时的完整截图后再试。');
+    if(expanded>250000||performance.now()-t0>60000)throw new Error(`求解超过60秒（已检查 ${expanded.toLocaleString()} 个局面，最好剩 ${bestRemain} 块）。这通常表示图案分组仍有歧义，而不是手机分辨率问题。`);
   }
   throw new Error('当前识别结果没有找到通关路线。可能是网格没对齐或有图案识别错误。');
 }
@@ -474,7 +471,7 @@ solveBtn.addEventListener('click',async()=>{
       const sizes=rec.bad.map(x=>x.length).join('、');
       throw new Error(`图案分组不完整（异常组大小：${sizes}）。请重新截一张完整游戏图后重试。`);
     }
-    recognitionStatus.innerHTML=`<span class="ok">✓ 自学习识别成功：</span>${rec.filled} 块砖，${rec.groups} 种图案（4块×${rec.n4}，2块×${rec.n2}），截图 ${rec.res}。正在搜索完整路线……`;
+    recognitionStatus.innerHTML=`<span class="ok">✓ 前景识别成功：</span>${rec.filled} 块砖，${rec.groups} 种图案（4块×${rec.n4}，2块×${rec.n2}），平均配对差异 ${rec.mean.toFixed(4)}，截图 ${rec.res}。正在搜索完整路线……`;
     await sleep(20);
     const sol=await solveBoard(initialBoard);
     solutionMoves=sol.moves;solutionStates=sol.states;stepIndex=0;
